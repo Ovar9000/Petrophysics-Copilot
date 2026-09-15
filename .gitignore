@@ -15,10 +15,6 @@ data/metadata_cache.json
 !data/.gitkeep
 !data/*_geology_report.md
 
-# Weaviate Vector DB Persistent Storage
-weaviate_data/
-data/weaviate_data/
-
 # ==============================================================================
 # Environment Configuration & Secrets
 # ==============================================================================
