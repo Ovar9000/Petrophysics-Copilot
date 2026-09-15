@@ -1712,7 +1712,9 @@ def plot_3d_wellbore_trajectory(
     tvd_col = cols.get("TVDSS") or cols.get("TVD")
     tvd = sub[tvd_col].values if tvd_col else -depths
 
-    d0 = depths[0]
+    # Always use the well's absolute start as the deviation reference so that
+    # the displayed (filtered) trace and any beacon highlight share the same XY frame.
+    d0 = df["DEPTH"].values[0]
     dev_x = 45.0 * np.sin((depths - d0) / 140.0)
     dev_y = 60.0 * (1.0 - np.cos((depths - d0) / 180.0))
     z = tvd
@@ -1894,14 +1896,14 @@ def plot_3d_wellbore_trajectory(
 
     # ── Sweet Spot Highlight Beacon ──────────────────────────────────────────
     if highlight_top is not None and highlight_base is not None:
-        # Find the wellbore segment indices for the full dataset (not filtered sub)
-        full_df = df.copy()
-        full_depths = full_df["DEPTH"].values
-        full_d0 = full_depths[0]
+        # Use the full dataset so the beacon covers depths outside the view slice,
+        # but use the same d0 as the main trajectory for consistent XY coordinates.
+        full_depths = df["DEPTH"].values
         full_tvd_col = cols.get("TVDSS") or cols.get("TVD")
-        full_tvd = full_df[full_tvd_col].values if full_tvd_col else -full_depths
-        full_x = 45.0 * np.sin((full_depths - full_d0) / 140.0)
-        full_y = 60.0 * (1.0 - np.cos((full_depths - full_d0) / 180.0))
+        full_tvd = df[full_tvd_col].values if full_tvd_col else -full_depths
+        # d0 is already set from df["DEPTH"].values[0] above – same reference frame
+        full_x = 45.0 * np.sin((full_depths - d0) / 140.0)
+        full_y = 60.0 * (1.0 - np.cos((full_depths - d0) / 180.0))
 
         hl_mask = (full_depths >= highlight_top) & (full_depths <= highlight_base)
         if np.any(hl_mask):
