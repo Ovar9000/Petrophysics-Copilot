@@ -1,0 +1,113 @@
+# ==============================================================================
+# Subsurface Well Log Data (Proprietary & High-Volume Files)
+# ==============================================================================
+data/*.las
+data/*.LAS
+data/*.dlis
+data/*.DLIS
+data/*.lis
+data/*.LIS
+data/*.parquet
+data/*.csv
+data/*.h5
+data/*.feather
+data/metadata_cache.json
+!data/.gitkeep
+!data/*_geology_report.md
+
+# Weaviate Vector DB Persistent Storage
+weaviate_data/
+data/weaviate_data/
+
+# ==============================================================================
+# Environment Configuration & Secrets
+# ==============================================================================
+.env
+.env.*
+!.env.example
+secrets.json
+*.pem
+*.key
+
+# ==============================================================================
+# Python & Testing Artifacts
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
+
+# Pytest & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+
+# ==============================================================================
+# Node.js & React Frontend Artifacts
+# ==============================================================================
+node_modules/
+frontend-react/node_modules/
+frontend-react/dist/
+frontend-react/.vite/
+frontend/node_modules/
+frontend/dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# ==============================================================================
+# Operating System & IDE Specific Files
+# ==============================================================================
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+*.tmp
+*.log
+# Temporary scratch files
+scratch_*.py
+test_verify_*.py
+test_plot.html
+last_chat_response.json
