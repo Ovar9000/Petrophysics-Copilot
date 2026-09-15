@@ -555,7 +555,8 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
     if "NEUT" in x_actual.upper() or "NPHI" in x_actual.upper():
         if np.nanmax(x_vals) <= 1.0:
             x_vals = x_vals * 100.0
-        x_title = f"{x_actual} (Porosity %)"
+        # Explicit axis title so readers don't need domain knowledge to parse units
+        x_title = "Neutron Porosity — NPHI (%)"
         # Detect artificial quantization (e.g. integer-binned neutron porosities) and apply slight Gaussian jitter
         rounded_x = np.round(x_vals, 2)
         unique_diffs = np.diff(np.sort(np.unique(rounded_x)))
@@ -566,18 +567,24 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
         x_title = x_actual
 
     if "DEN" in y_actual.upper() or "RHOB" in y_actual.upper():
-        y_title = f"{y_actual} (g/cm³)"
+        # Explicit axis title so readers don't need domain knowledge to parse units
+        y_title = "Bulk Density — RHOB (g/cc)"
     else:
         y_title = y_actual
-            
+
     fig = go.Figure()
-    marker_dict: Dict[str, Any] = dict(size=6, opacity=0.75)
-    
+    # Slight transparency so dense-cluster centers read as darker than edge outliers
+    marker_dict: Dict[str, Any] = dict(size=6, opacity=0.65)
+
     if z_actual and z_actual in sub_df.columns:
         z_vals = sub_df[z_actual].values
         marker_dict["color"] = z_vals
         marker_dict["colorscale"] = "Viridis"
-        colorbar_title = f"<b>{z_actual} (API)</b>" if "GR" in z_actual.upper() else f"<b>{z_actual}</b>"
+        if "GR" in z_actual.upper():
+            # One-line convention caption: saves readers from needing the GR/shaliness convention
+            colorbar_title = f"<b>{z_actual} (API)</b><br><span style='font-size:9px'>Low GR = clean · High GR = shaly</span>"
+        else:
+            colorbar_title = f"<b>{z_actual}</b>"
         marker_dict["colorbar"] = dict(
             title=dict(text=colorbar_title, side="top"),
             thickness=14,
@@ -592,7 +599,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
         hovertemplate = (
             f"<b>Depth:</b> %{{customdata[0]:.1f}} m<br>"
             f"<b>{x_actual}:</b> %{{x:.2f}}%<br>"
-            f"<b>{y_actual}:</b> %{{y:.3f}} g/cm³<br>"
+            f"<b>{y_actual}:</b> %{{y:.3f}} g/cc<br>"
             f"<b>{z_actual}:</b> %{{customdata[1]:.1f}}{z_unit}<extra></extra>"
         )
     else:
@@ -601,7 +608,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
         hovertemplate = (
             f"<b>Depth:</b> %{{customdata:.1f}} m<br>"
             f"<b>{x_actual}:</b> %{{x:.2f}}%<br>"
-            f"<b>{y_actual}:</b> %{{y:.3f}} g/cm³<extra></extra>"
+            f"<b>{y_actual}:</b> %{{y:.3f}} g/cc<extra></extra>"
         )
 
     fig.add_trace(
@@ -629,27 +636,31 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
             dict(x=0, y=2.87, text="<b>Dolomite (2.87)</b>", showarrow=True, arrowhead=2, ax=-55, ay=15, font=dict(color="#b91c1c", size=9), bgcolor="rgba(254, 226, 226, 0.9)", bordercolor="#ef4444", borderwidth=1),
         ]
 
-        # Gas Correction Vector: Highlight low-density/low-neutron gas cluster and point down towards quartz sandstone line
+        # Gas Correction Vector: park the text box in the petrophysically-empty
+        # top-right corner (high NPHI + low RHOB is unphysical, so always whitespace)
+        # with a thin leader line back into the gas cluster — never over the points.
         gas_mask = (x_vals < 10.0) & (y_vals < 2.42) & (y_vals > 2.10)
         if np.sum(gas_mask) >= 6:
             mean_gas_x = float(np.mean(x_vals[gas_mask]))
             mean_gas_y = float(np.mean(y_vals[gas_mask]))
-            # On reversed y-axis, positive y offset moves downward on screen toward quartz sandstone line
+            label_x = float(np.nanpercentile(x_vals, 96))
+            # On the reversed y-axis, smaller y renders higher on screen ("up")
+            label_y = float(min(mean_gas_y - 0.20, np.nanpercentile(y_vals, 6)))
             annotations.append(
                 dict(
-                    x=mean_gas_x + 10.0,
-                    y=mean_gas_y + 0.12,
+                    x=label_x,
+                    y=label_y,
                     xref="x",
                     yref="y",
                     ax=mean_gas_x,
-                    ay=mean_gas_y - 0.05,
+                    ay=mean_gas_y,
                     axref="x",
                     ayref="y",
                     text="<b>Gas Correction Vector</b><br><i>(Hydrocarbon crossover shift)</i>",
                     showarrow=True,
-                    arrowhead=3,
-                    arrowsize=1.3,
-                    arrowwidth=2.5,
+                    arrowhead=2,
+                    arrowsize=1.0,
+                    arrowwidth=1.2,
                     arrowcolor="#dc2626",
                     font=dict(color="#b91c1c", size=9, family="Inter, sans-serif"),
                     bgcolor="rgba(254, 242, 242, 0.95)",
@@ -659,10 +670,43 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
                 )
             )
 
+        # Second rock population: high-NPHI + high-RHOB (+ high GR when available)
+        # renders lower-right on screen — label it so the story reads at a glance.
+        shale_mask = (x_vals >= float(np.nanpercentile(x_vals, 60))) & \
+                     (y_vals >= float(np.nanpercentile(y_vals, 55)))
+        if z_actual and "GR" in z_actual.upper() and "z_vals" in locals():
+            shale_mask = shale_mask & (z_vals >= float(np.nanmedian(z_vals)))
+        if np.sum(shale_mask) >= 8:
+            sh_x = float(np.nanmedian(x_vals[shale_mask]))
+            sh_y = float(np.nanmedian(y_vals[shale_mask]))
+            annotations.append(
+                dict(
+                    x=sh_x,
+                    y=sh_y,
+                    text="<b>Shaly interval</b><br><i>(sand-shale mix)</i>",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowsize=1.0,
+                    arrowwidth=1.2,
+                    arrowcolor="#0d9488",
+                    ax=-80,
+                    ay=-25,
+                    font=dict(color="#0f766e", size=9, family="Inter, sans-serif"),
+                    bgcolor="rgba(240, 253, 250, 0.92)",
+                    bordercolor="#14b8a6",
+                    borderwidth=1.2,
+                    borderpad=4
+                )
+            )
+
     well_title = las.well.WELL.value if "WELL" in las.well else well_id
+    if is_rhob_nphi:
+        title_text = f"<b>Density–Neutron Crossplot: Lithology & Gas Effect</b> ({well_title})"
+    else:
+        title_text = f"<b>2D Lithology Crossplot: {y_actual} vs. {x_actual}</b> ({well_title})"
     fig.update_layout(
         title=dict(
-            text=f"<b>2D Lithology Crossplot: {y_actual} vs. {x_actual}</b> ({well_title})",
+            text=title_text,
             x=0.02,
             xanchor="left"
         ),
@@ -712,35 +756,45 @@ def compute_net_pay(
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     cols = {c.upper(): c for c in sub_df.columns}
     
-    # 1. Vsh
+    # 1. Vsh (track the method for the audit footnote)
     if "VSHALE" in cols:
         vsh = sub_df[cols["VSHALE"]].values
+        vsh_method = f"Vsh from {cols['VSHALE']} log direct"
     elif "GR" in cols:
         gr = sub_df[cols["GR"]].values
         gr_clean = float(np.nanpercentile(gr, 5)) if np.sum(~np.isnan(gr)) > 10 else 20.0
         gr_shale = float(np.nanpercentile(gr, 95)) if np.sum(~np.isnan(gr)) > 10 else 120.0
         igr = np.clip((gr - gr_clean) / max(gr_shale - gr_clean, 1.0), 0.0, 1.0)
         vsh = 0.083 * (np.power(2.0, 3.7 * igr) - 1.0)
+        vsh_method = (f"Vsh from GR via Larionov-T "
+                      f"(GRclean P5={gr_clean:.0f} / GRshale P95={gr_shale:.0f} API)")
     else:
         vsh = np.zeros(len(depths))
+        vsh_method = "Vsh = 0 assumed (no GR/VSHALE)"
 
     # 2. Porosity
     if "PHIE" in cols:
         phi = sub_df[cols["PHIE"]].values
+        phi_method = f"Porosity from {cols['PHIE']} log direct"
     elif "DENB" in cols or "RHOB" in cols:
         den_col = cols.get("DENB") or cols.get("RHOB")
         phi = np.clip((2.65 - sub_df[den_col].values) / (2.65 - 1.0), 0.0, 0.45)
+        phi_method = f"Porosity from density ({den_col}, rho_ma 2.65 / rho_f 1.0)"
     else:
         phi = np.full(len(depths), 0.15)
+        phi_method = "Porosity = 0.15 assumed (no PHIE/DENB)"
 
     # 3. Water Saturation
     if "SWE" in cols:
         sw = sub_df[cols["SWE"]].values
+        sw_method = f"Sw from {cols['SWE']} log direct"
     elif "RDEEP" in cols:
         rdeep = np.maximum(sub_df[cols["RDEEP"]].values, 0.1)
         sw = np.sqrt(np.clip((1.0 * 0.05) / (np.maximum(phi, 0.01)**2.0 * rdeep), 0.0, 1.0))
+        sw_method = "Sw via Archie-type (a·Rw 0.05, m = n = 2)"
     else:
         sw = np.ones(len(depths))
+        sw_method = "Sw = 1 assumed (no SWE/RDEEP)"
 
     valid = (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw))
     is_res = (vsh <= vsh_cutoff) & (phi >= phi_cutoff) & valid
@@ -790,6 +844,24 @@ def compute_net_pay(
                 "net_to_gross": round(s_pay_m / gross, 4) if gross > 0 else 0.0
             })
 
+    # Deterministic uncertainty from the cutoff ensemble spread:
+    # P50 = base case, P90 = conservative (10th pct), P10 = optimistic (90th pct).
+    sens_vals = np.array([c["net_pay_m"] for c in cutoff_sensitivity], dtype=float)
+    p90_m = round(float(np.percentile(sens_vals, 10)), 2)
+    p50_m = round(net_pay, 2)
+    p10_m = round(float(np.percentile(sens_vals, 90)), 2)
+    net_pay_uncertainty = {
+        "p90_m": p90_m,
+        "p50_m": p50_m,
+        "p10_m": p10_m,
+        "plus_minus_m": round((p10_m - p90_m) / 2.0, 2),
+        "basis": (f"P90–P10 spread across 3×3 Vsh/Phi cutoff ensemble "
+                  f"(Vsh 0.20–0.40, Phi 0.08–0.12, Sw ≤ {sw_cutoff:g})")
+    }
+
+    methodology = (f"{vsh_method}; {phi_method}; {sw_method}. "
+                   f"Cutoffs Vsh ≤ {vsh_cutoff:g}, Phi ≥ {phi_cutoff:g}, Sw ≤ {sw_cutoff:g}.")
+
     return {
         "well_id": well_id,
         "well_name": las.well.WELL.value if "WELL" in las.well else well_id,
@@ -807,7 +879,9 @@ def compute_net_pay(
         },
         "cum_pay_curve": cum_pay_curve,
         "facies_breakdown": facies_breakdown,
-        "cutoff_sensitivity": cutoff_sensitivity
+        "cutoff_sensitivity": cutoff_sensitivity,
+        "net_pay_uncertainty": net_pay_uncertainty,
+        "methodology": methodology
     }
 
 
@@ -1699,11 +1773,21 @@ def plot_3d_wellbore_trajectory(
     """
     las, df = read_las(well_id)
     cols = {c.upper(): c for c in df.columns}
+    # When a target highlight is requested, expand the effective view to always
+    # include the highlight interval. Otherwise the amber beacon (drawn at true
+    # hole coordinates) can appear floating far from a wellbore segment that
+    # was sliced to a range excluding the target.
+    has_highlight = highlight_top is not None and highlight_base is not None
+    view_top = top_depth
+    view_bot = bottom_depth
+    if has_highlight:
+        view_top = highlight_top if view_top is None else min(view_top, highlight_top)
+        view_bot = highlight_base if view_bot is None else max(view_bot, highlight_base)
     sub = df.copy()
-    if top_depth is not None:
-        sub = sub[sub["DEPTH"] >= top_depth]
-    if bottom_depth is not None:
-        sub = sub[sub["DEPTH"] <= bottom_depth]
+    if view_top is not None:
+        sub = sub[sub["DEPTH"] >= view_top]
+    if view_bot is not None:
+        sub = sub[sub["DEPTH"] <= view_bot]
 
     depths = sub["DEPTH"].values
     if len(depths) == 0:
@@ -1895,21 +1979,19 @@ def plot_3d_wellbore_trajectory(
         ))
 
     # ── Sweet Spot Highlight Beacon ──────────────────────────────────────────
-    if highlight_top is not None and highlight_base is not None:
-        # Use the full dataset so the beacon covers depths outside the view slice,
-        # but use the same d0 as the main trajectory for consistent XY coordinates.
-        full_depths = df["DEPTH"].values
-        full_tvd_col = cols.get("TVDSS") or cols.get("TVD")
-        full_tvd = df[full_tvd_col].values if full_tvd_col else -full_depths
-        # d0 is already set from df["DEPTH"].values[0] above – same reference frame
-        full_x = 45.0 * np.sin((full_depths - d0) / 140.0)
-        full_y = 60.0 * (1.0 - np.cos((full_depths - d0) / 180.0))
-
-        hl_mask = (full_depths >= highlight_top) & (full_depths <= highlight_base)
+    hl_focus = None
+    highlight_matched = False
+    if has_highlight:
+        # Derive the highlight from the SAME displayed arrays (depths/dev_x/
+        # dev_y/z) so it is mathematically impossible for the beacon to sit
+        # off-hole. The view slice above was already expanded to include the
+        # highlight interval, so this mask is normally non-empty.
+        hl_mask = (depths >= highlight_top) & (depths <= highlight_base)
         if np.any(hl_mask):
-            hx = full_x[hl_mask]
-            hy = full_y[hl_mask]
-            hz = full_tvd[hl_mask]
+            highlight_matched = True
+            hx = dev_x[hl_mask]
+            hy = dev_y[hl_mask]
+            hz = z[hl_mask]
 
             # Thick amber "glowing" segment
             fig.add_trace(go.Scatter3d(
@@ -1919,38 +2001,69 @@ def plot_3d_wellbore_trajectory(
                             line=dict(color="#fef3c7", width=2)),
                 line=dict(color="#d97706", width=10),
                 text=[f"🎯 TARGET SWEET SPOT<br>{highlight_label or ''}<br>MD: {d:.1f}m"
-                      for d in full_depths[hl_mask]],
+                      for d in depths[hl_mask]],
                 hoverinfo="text",
                 name=f"🎯 Target: {highlight_label or 'Sweet Spot'}"
             ))
 
-            # Callout beacon pin above the mid-point
+            # Callout beacon pin: keep it tightly coupled to the wellbore so the
+            # visual clearly corresponds. Same XY as the wellbore mid-point, with
+            # only a small Z offset + an explicit leader line back to the hole.
             mid_idx = len(hx) // 2
-            beacon_z = float(hz[mid_idx]) - abs(float(z.max() - z.min())) * 0.05
+            mx = float(hx[mid_idx])
+            my = float(hy[mid_idx])
+            mz = float(hz[mid_idx])
+            hl_thickness = max(float(highlight_base - highlight_top), 1.0)
+            # Small clamped offset scaled to the TARGET (not the view span, which
+            # can be 100m+ and used to leave the beacon floating ~20m off-hole).
+            beacon_offset = float(np.clip(hl_thickness * 1.2, 3.0, 8.0))
+            # z decreases with depth here (TVDSS negative / -MD), so deeper =
+            # smaller z. Place the beacon just below the target (deeper) and
+            # draw a leader back up to the wellbore.
+            beacon_z = mz - beacon_offset
+
+            # Leader line: wellbore mid-point -> beacon (makes correspondence explicit)
+            fig.add_trace(go.Scatter3d(
+                x=[mx, mx],
+                y=[my, my],
+                z=[mz, beacon_z],
+                mode="lines",
+                line=dict(color="#ef4444", width=4, dash="solid"),
+                showlegend=False,
+                hoverinfo="skip",
+                name="_target_leader"
+            ))
 
             fig.add_trace(go.Scatter3d(
-                x=[float(hx[mid_idx])],
-                y=[float(hy[mid_idx])],
+                x=[mx],
+                y=[my],
                 z=[beacon_z],
                 mode="text+markers",
                 marker=dict(size=14, color="#ef4444", symbol="circle",
                             line=dict(color="#fca5a5", width=3)),
                 text=[f"<b>🎯 TARGET SWEET SPOT</b><br>{highlight_label or ''}<br>{highlight_top:.0f}m – {highlight_base:.0f}m MD"],
-                textposition="top center",
+                textposition="bottom center",
                 textfont=dict(color="#7f1d1d", size=12, family="monospace"),
                 hoverinfo="text",
                 name="Target Beacon"
             ))
 
-            # Camera: orient toward mid-point of the highlight
-            eye_x = float(hx[mid_idx]) / max(abs(float(hx.max())), 1) * 2.0 + 1.2
-            eye_y = float(hy[mid_idx]) / max(abs(float(hy.max())), 1) * 2.0 + 1.2
-            fig.update_layout(
-                scene_camera=dict(eye=dict(x=eye_x, y=eye_y, z=0.85))
-            )
+            # Zoom the scene to the highlight so a thin (few-m) target is not a
+            # sub-pixel dot inside a 400m context window. Window scales with the
+            # target thickness, clamped to a usable overview. Applied AFTER the
+            # base layout below so axis titles/camera defaults don't wipe it.
+            xy_margin = float(np.clip(hl_thickness * 6.0, 25.0, 80.0))
+            z_margin = float(np.clip(hl_thickness * 8.0, 20.0, 90.0))
+            hl_focus = (mx, my, mz, xy_margin, z_margin)
 
+    fig_title = f"<b>3D Subsurface Wellbore Trajectory: {well_id}</b> (Color by: {active_attr.upper()})"
+    if has_highlight:
+        if highlight_matched:
+            fig_title += f" | 🎯 Zone {highlight_top:.0f}–{highlight_base:.0f}m"
+        else:
+            fig_title += " | ⚠️ Target outside data range"
     fig.update_layout(
-        title=f"<b>3D Subsurface Wellbore Trajectory: {well_id}</b> (Color by: {active_attr.upper()})",
+        title=fig_title,
         template="plotly_white",
         scene=dict(
             xaxis_title="Easting X (m)",
@@ -1974,11 +2087,25 @@ def plot_3d_wellbore_trajectory(
         margin=dict(l=20, r=160, t=50, b=30),
     )
 
+    if hl_focus is not None:
+        mx, my, mz, xy_margin, z_margin = hl_focus
+        fig.update_layout(
+            scene=dict(
+                xaxis=dict(range=[mx - xy_margin, mx + xy_margin]),
+                yaxis=dict(range=[my - xy_margin, my + xy_margin]),
+                zaxis=dict(range=[mz - z_margin, mz + z_margin]),
+                camera=dict(eye=dict(x=1.65, y=1.65, z=0.95)),
+            )
+        )
+
     return {
         "well_id": well_id,
         "total_depth_samples": int(len(depths)),
         "pay_samples": int(np.sum(is_pay)),
         "color_by": active_attr,
+        "view_top_m": float(view_top) if view_top is not None else None,
+        "view_base_m": float(view_bot) if view_bot is not None else None,
+        "highlight_matched": bool(highlight_matched) if has_highlight else None,
         "figure_json": fig.to_json()
     }
 

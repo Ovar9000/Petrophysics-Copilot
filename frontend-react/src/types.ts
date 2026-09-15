@@ -64,6 +64,14 @@ export interface NetPayKPIs {
     net_pay_m: number;
     net_to_gross: number;
   }>;
+  net_pay_uncertainty?: {
+    p90_m: number;
+    p50_m: number;
+    p10_m: number;
+    plus_minus_m: number;
+    basis: string;
+  };
+  methodology?: string;
 }
 
 export interface SweetspotItem {

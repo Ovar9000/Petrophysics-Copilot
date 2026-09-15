@@ -343,6 +343,31 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
   const currentNetPay = currentWellCache.kpis || (netPayData?.well_id === selectedWell ? netPayData : null);
   const currentCitations = currentWellCache.citations || (citations?.length && citations[0]?.well_name?.includes(selectedWell) ? citations : []);
 
+  // Net Pay dashboard helpers: sensitivity heat range + cumulative-chart facies shading.
+  // Coherent color key across the dashboard: pay = green, wet reservoir = blue, non-pay = gray.
+  const sensCells = currentNetPay?.cutoff_sensitivity ?? [];
+  const sensMin = sensCells.length ? Math.min(...sensCells.map((c) => c.net_pay_m)) : 0;
+  const sensMax = sensCells.length ? Math.max(...sensCells.map((c) => c.net_pay_m)) : 0;
+  const sensHeatBg = (v: number) => {
+    const t = sensMax > sensMin ? (v - sensMin) / (sensMax - sensMin) : 0.5;
+    return `rgba(16, 185, 129, ${(0.06 + 0.55 * t).toFixed(3)})`;
+  };
+  const cumCurve = currentNetPay?.cum_pay_curve ?? [];
+  const cumXMax = cumCurve.length ? Math.max(...cumCurve.map((p) => p.cum_pay_m)) : 0;
+  const cumXEnd = cumXMax > 0 ? cumXMax * 1.07 : 1;
+  // Flat runs (constant cum pay across consecutive samples) = non-pay intervals.
+  const nonPayRuns: Array<{ y0: number; y1: number; cum: number }> = [];
+  for (let i = 0; i + 1 < cumCurve.length; i++) {
+    if (Math.abs(cumCurve[i + 1].cum_pay_m - cumCurve[i].cum_pay_m) < 1e-9) {
+      const last = nonPayRuns[nonPayRuns.length - 1];
+      if (last && Math.abs(last.y1 - cumCurve[i].depth) < 1e-9) {
+        last.y1 = cumCurve[i + 1].depth;
+      } else {
+        nonPayRuns.push({ y0: cumCurve[i].depth, y1: cumCurve[i + 1].depth, cum: cumCurve[i].cum_pay_m });
+      }
+    }
+  }
+
   // Parsed 1D Curves with Interactive 1 Continuous Horizontal Line Across 3 Graphs
   const parsed1DPlot = useMemo(() => {
     const rawJson = current1dJson;
@@ -501,10 +526,17 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     if (!rawJson) return null;
     try {
       const spec = JSON.parse(rawJson);
+      // Include the active target in uirevision so "Locate on 3D Wellbore"
+      // forces Plotly to apply the backend's zoomed camera/axis ranges.
+      // (With a static uirevision, Plotly keeps the old camera and the new
+      // target stays a tiny dot in a wide view, looking detached.)
+      const targetKey = highlightedSweetspot
+        ? `-${highlightedSweetspot.top}-${highlightedSweetspot.base}`
+        : '-full';
       const lightLayout = {
         ...spec.layout,
         autosize: true,
-        uirevision: `${selectedWell}-3d`,
+        uirevision: `${selectedWell}-3d${targetKey}`,
         paper_bgcolor: '#FFFFFF',
         font: { family: 'Inter, system-ui, sans-serif', color: '#334155', size: 11 },
         margin: spec.layout?.margin || { l: 20, r: 160, t: 40, b: 20 },
@@ -549,7 +581,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       console.error('Failed to parse 3D Plotly JSON:', e);
       return null;
     }
-  }, [current3dJson, selectedWell]);
+  }, [current3dJson, selectedWell, highlightedSweetspot]);
 
   const handleDownloadJson = () => {
     const jsonToDownload = activeTab === '3d' 
@@ -988,7 +1020,11 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                 <button
                   onClick={() => {
                     setHighlightedSweetspot(null);
-                    loadDirect3D('trajectory', selectedWell, depthMin, depthMax, 'sweetspots');
+                    const fullTop = selectedWell === 'Well1' ? 1800 : 3550;
+                    const fullBot = selectedWell === 'Well1' ? 2000 : 3850;
+                    setDepthMin(fullTop);
+                    setDepthMax(fullBot);
+                    loadDirect3D('trajectory', selectedWell, fullTop, fullBot, 'sweetspots');
                   }}
                   className="px-2 py-0.5 bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 rounded text-[10px] cursor-pointer transition-colors"
                 >
@@ -1072,8 +1108,11 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                         </span>
                         <button
                           onClick={() => {
-                            // Keep generous context window – show ±200m around the sweet spot
-                            const ctxMargin = 200;
+                            // Tight context window so a thin target fills the view.
+                            // (Was ±200m: a 3.8m target was <1% of the track and the
+                            // 20m-offset beacon looked detached from the wellbore.)
+                            const thickness = Math.max(1, z.base_depth - z.top_depth);
+                            const ctxMargin = Math.min(80, Math.max(40, thickness * 4 + 20));
                             const ctxTop = Math.max(0, Math.floor(z.top_depth - ctxMargin));
                             const ctxBot = Math.ceil(z.base_depth + ctxMargin);
                             setDepthMin(ctxTop);
@@ -1227,20 +1266,30 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                     <div className="text-[10px] text-zinc-400 mt-1 font-mono">
                       Hydrocarbon productive
                     </div>
+                    {currentNetPay.net_pay_uncertainty && (
+                      <div className="text-[10px] text-emerald-700 mt-1 font-mono" title={currentNetPay.net_pay_uncertainty.basis}>
+                        P90–P10: {currentNetPay.net_pay_uncertainty.p90_m}–{currentNetPay.net_pay_uncertainty.p10_m} m (±{currentNetPay.net_pay_uncertainty.plus_minus_m})
+                      </div>
+                    )}
                   </div>
 
                   <div className="bg-white border border-zinc-200 rounded-lg p-3.5 shadow-xs">
                     <div className="text-[10px] uppercase font-mono tracking-wider text-zinc-400">Net-to-Gross (NTG)</div>
-                    <div className="text-2xl font-bold font-mono text-amber-600 mt-1">
+                    <div className="text-2xl font-bold font-mono text-emerald-600 mt-1">
                       {(currentNetPay.net_to_gross * 100).toFixed(1)}%
                     </div>
                     <div className="w-full bg-zinc-100 h-1 rounded-full mt-2 overflow-hidden border border-zinc-200">
-                      <div 
-                        className="bg-amber-500 h-full rounded-full transition-all duration-500"
+                      <div
+                        className="bg-emerald-500 h-full rounded-full transition-all duration-500"
                         style={{ width: `${Math.min(100, Math.max(3, currentNetPay.net_to_gross * 100))}%` }}
                       />
                     </div>
                   </div>
+                </div>
+                <div className="flex items-center gap-4 text-[10px] font-mono text-zinc-400 px-1">
+                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" /> Pay (green)</span>
+                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-blue-500 inline-block" /> Wet reservoir (blue)</span>
+                  <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-slate-400 inline-block" /> Non-pay / gross (gray)</span>
                 </div>
 
                 <div className="bg-white border border-zinc-200 rounded-lg p-4 shadow-xs">
@@ -1359,14 +1408,40 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                             line: { shape: 'hv', color: '#059669', width: 2.2 },
                             fill: 'tozerox',
                             fillcolor: 'rgba(16, 185, 129, 0.15)',
+                            hovertemplate: 'Cum pay: %{x:.2f} m<br>Depth: %{y:.1f} m MD<extra></extra>',
                             name: 'Cum Pay (m)'
-                          }
+                          },
+                          ...(nonPayRuns.length > 0 ? [{
+                            x: nonPayRuns.map(() => cumXEnd * 0.5),
+                            y: nonPayRuns.map((r) => (r.y0 + r.y1) / 2),
+                            type: 'scatter' as const,
+                            mode: 'markers' as const,
+                            marker: { size: 14, opacity: 0, color: 'rgba(0,0,0,0)' },
+                            hovertemplate: nonPayRuns.map((r) =>
+                              `Non-pay interval (wet or tight/shale)<br>${r.y0.toFixed(1)}–${r.y1.toFixed(1)} m MD<br>Cum pay flat at ${r.cum.toFixed(2)} m<extra></extra>`
+                            ),
+                            hoverlabel: { bgcolor: '#27272a', font: { color: '#fafafa', size: 10 } },
+                            showlegend: false,
+                            name: 'Non-pay'
+                          }] : [])
                         ]}
                         layout={{
                           autosize: true,
                           margin: { l: 60, r: 25, t: 20, b: 40 },
                           paper_bgcolor: '#FFFFFF',
                           plot_bgcolor: '#FFFFFF',
+                          shapes: nonPayRuns.map((r) => ({
+                            type: 'rect' as const,
+                            layer: 'below' as const,
+                            xref: 'x' as const,
+                            yref: 'y' as const,
+                            x0: 0,
+                            x1: cumXEnd,
+                            y0: r.y0,
+                            y1: r.y1,
+                            fillcolor: 'rgba(148, 163, 184, 0.13)',
+                            line: { width: 0 }
+                          })),
                           yaxis: {
                             autorange: 'reversed',
                             title: { text: 'Depth MD (m)', font: { size: 10, color: '#64748b' } },
@@ -1374,7 +1449,8 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                           },
                           xaxis: {
                             title: { text: 'Cumulative Net Pay (m)', font: { size: 10, color: '#64748b' } },
-                            gridcolor: '#F1F5F9'
+                            gridcolor: '#F1F5F9',
+                            range: [0, cumXEnd]
                           }
                         }}
                         useResizeHandler={true}
@@ -1390,10 +1466,10 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   <div className="bg-white border border-zinc-200 rounded-lg p-4 shadow-xs">
                     <div className="flex items-center justify-between mb-3">
                       <h4 className="text-xs font-semibold text-zinc-800 uppercase tracking-wider font-mono">
-                        Volumetric Cutoff Sensitivity Matrix (Sw ≤ {currentNetPay.pay_zone_averages ? '50%' : '50%'})
+                        Volumetric Cutoff Sensitivity Matrix (Sw ≤ {((currentNetPay.cutoff_sensitivity?.[0]?.sw_cutoff ?? 0.5) * 100).toFixed(0)}%)
                       </h4>
                       <span className="text-[10px] text-zinc-500 font-mono">
-                        Net Pay (m) · Net-to-Gross (%)
+                        Net Pay (m) · Net-to-Gross (%) · darker green = higher pay
                       </span>
                     </div>
 
@@ -1422,12 +1498,15 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                                     (s) => Math.abs(s.vsh_cutoff - vCut) < 0.01 && Math.abs(s.phi_cutoff - pCut) < 0.01
                                   );
                                   const isBaseCell = vCut === 0.30 && pCut === 0.10;
+                                  const heat = cell ? sensHeatBg(cell.net_pay_m) : undefined;
                                   return (
-                                    <td 
-                                      key={pCut} 
+                                    <td
+                                      key={pCut}
+                                      style={heat ? { backgroundColor: heat } : undefined}
+                                      title={cell ? `Vsh ≤ ${vCut}, Φ ≥ ${pCut}: ${cell.net_pay_m} m pay` : undefined}
                                       className={`border border-zinc-200 p-2 ${
-                                        isBaseCell 
-                                          ? 'bg-emerald-100/70 text-emerald-900 font-bold border-emerald-400' 
+                                        isBaseCell
+                                          ? 'text-emerald-900 font-bold border-emerald-500 ring-1 ring-inset ring-emerald-500'
                                           : 'text-zinc-800'
                                       }`}
                                     >
@@ -1448,6 +1527,16 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                         </tbody>
                       </table>
                     </div>
+                  </div>
+                )}
+
+                {/* Methodology audit footnote */}
+                {currentNetPay.methodology && (
+                  <div className="text-[10px] font-mono text-zinc-400 px-1 leading-relaxed">
+                    Method: {currentNetPay.methodology}
+                    {currentNetPay.net_pay_uncertainty && (
+                      <span> Uncertainty: {currentNetPay.net_pay_uncertainty.basis}.</span>
+                    )}
                   </div>
                 )}
               </>
