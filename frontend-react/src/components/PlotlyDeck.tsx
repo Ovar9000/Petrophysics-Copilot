@@ -65,6 +65,12 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
   const [depthMax, setDepthMax] = useState<number>(2000);
   const [depthMarker, setDepthMarker] = useState<number | null>(null);
   const [showCorrelationLine, setShowCorrelationLine] = useState<boolean>(true);
+  const [showHorizon, setShowHorizon] = useState<boolean>(true);
+  const [highlightedSweetspot, setHighlightedSweetspot] = useState<{
+    label: string;
+    top: number;
+    base: number;
+  } | null>(null);
 
   // Sync default depth ranges and correlation line marker on well change, and load active tab
   useEffect(() => {
@@ -228,7 +234,11 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     targetWell?: string,
     customTop?: number,
     customBot?: number,
-    customColorBy?: 'sweetspots' | 'rdeep' | 'gr' | 'tvdss'
+    customColorBy?: 'sweetspots' | 'rdeep' | 'gr' | 'tvdss',
+    highlightTop?: number,
+    highlightBase?: number,
+    highlightLabelStr?: string,
+    horizonOverride?: boolean
   ) => {
     setLoading3d(true);
     setCurrent3dMode(mode);
@@ -236,6 +246,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     const top = customTop !== undefined ? customTop : depthMin;
     const bot = customBot !== undefined ? customBot : depthMax;
     const activeColor = customColorBy !== undefined ? customColorBy : trajColorBy;
+    const useHorizon = horizonOverride !== undefined ? horizonOverride : showHorizon;
     if (customColorBy !== undefined) {
       setTrajColorBy(customColorBy);
     }
@@ -244,6 +255,10 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       const body: any = { well_id: well, top_depth: top, bottom_depth: bot };
       if (mode === 'trajectory') {
         body.color_by = activeColor;
+        body.show_horizon = useHorizon;
+        if (highlightTop !== undefined) body.highlight_top = highlightTop;
+        if (highlightBase !== undefined) body.highlight_base = highlightBase;
+        if (highlightLabelStr !== undefined) body.highlight_label = highlightLabelStr;
       }
       const res = await fetch(`${API_BASE}${endpoint}`, {
         method: 'POST',
@@ -941,7 +956,46 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   </div>
                 </div>
               )}
+
+              {/* Show Geological Horizon Toggle */}
+              {current3dMode === 'trajectory' && (
+                <div className="flex items-center gap-2 px-3 py-1 bg-amber-50/70 border-t border-amber-100 text-xs font-mono">
+                  <label className="flex items-center gap-1.5 cursor-pointer select-none text-amber-800">
+                    <input
+                      type="checkbox"
+                      checked={showHorizon}
+                      onChange={(e) => {
+                        setShowHorizon(e.target.checked);
+                        loadDirect3D('trajectory', selectedWell, depthMin, depthMax, undefined, undefined, undefined, undefined, e.target.checked);
+                      }}
+                      className="accent-amber-600 w-3.5 h-3.5"
+                    />
+                    <span className="font-semibold">Show Geological Horizon</span>
+                    <span className="text-amber-600/70 text-[10px]">(Top Reservoir Surface · Earth colormap · Dip ~3.1° SE)</span>
+                  </label>
+                </div>
+              )}
             </div>
+
+            {/* 🎯 Active Target Locator Banner */}
+            {highlightedSweetspot && activeTab === '3d' && (
+              <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-50 border-b border-amber-200 text-xs font-mono">
+                <div className="flex items-center gap-1.5 text-amber-800">
+                  <span className="text-base">🎯</span>
+                  <span className="font-semibold">Target Located on 3D Wellbore:</span>
+                  <span className="text-amber-700">{highlightedSweetspot.label}</span>
+                </div>
+                <button
+                  onClick={() => {
+                    setHighlightedSweetspot(null);
+                    loadDirect3D('trajectory', selectedWell, depthMin, depthMax, 'sweetspots');
+                  }}
+                  className="px-2 py-0.5 bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 rounded text-[10px] cursor-pointer transition-colors"
+                >
+                  ✕ Reset View
+                </button>
+              </div>
+            )}
 
             {loading3d ? (
               <div className="flex-1 flex flex-col items-center justify-center text-zinc-400 gap-2 py-20 min-h-[500px]">
@@ -1018,14 +1072,19 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                         </span>
                         <button
                           onClick={() => {
-                            const margin = 20;
-                            const top = Math.max(0, Math.floor(z.top_depth - margin));
-                            const bot = Math.ceil(z.base_depth + margin);
-                            setDepthMin(top);
-                            setDepthMax(bot);
+                            // Keep generous context window – show ±200m around the sweet spot
+                            const ctxMargin = 200;
+                            const ctxTop = Math.max(0, Math.floor(z.top_depth - ctxMargin));
+                            const ctxBot = Math.ceil(z.base_depth + ctxMargin);
+                            setDepthMin(ctxTop);
+                            setDepthMax(ctxBot);
                             setCurrent3dMode('trajectory');
-                            setActiveTab('3d');
-                            loadDirect3D('trajectory', selectedWell, top, bot, 'sweetspots');
+                            const label = `Zone ${z.top_depth}–${z.base_depth}m | Net Pay ${z.thickness_m}m`;
+                            setHighlightedSweetspot({ label, top: z.top_depth, base: z.base_depth });
+                            loadDirect3D(
+                              'trajectory', selectedWell, ctxTop, ctxBot, 'sweetspots',
+                              z.top_depth, z.base_depth, label
+                            );
                           }}
                           className="px-2.5 py-1 text-xs font-mono bg-zinc-900 hover:bg-zinc-800 text-white rounded flex items-center gap-1.5 transition-colors cursor-pointer shadow-2xs"
                           title="View this sweet spot on the 3D wellbore trajectory"

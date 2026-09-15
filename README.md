@@ -114,7 +114,7 @@ sequenceDiagram
 ### Why Deterministic Tool Calling?
 Language models struggle with precision floating-point calculations across tens of thousands of depth samples. Calculating cumulative reservoir pay over an interval of 5,000 depth rows requires strict mathematical evaluations:
 
-$$\text{Net Pay} = \sum \Delta z \quad \text{where} \quad (V_{\text{sh}} \le V_{\text{sh\_cut}}) \land (\phi_e \ge \phi_{\text{cut}}) \land (S_w \le S_{w\_\text{cut}})$$
+$$\text{Net Pay} = \sum \Delta z \quad \text{where} \quad (V_{\text{sh}} \le V_{\text{cutoff}}) \land (\phi_e \ge \phi_{\text{cutoff}}) \land (S_w \le S_{w,\text{cutoff}})$$
 
 Instead of asking the LLM to approximate mathematical values, **the LLM functions solely as an autonomous tool router**:
 1. It analyzes the user query to extract parameters (well ID, interval bounds, cutoffs).

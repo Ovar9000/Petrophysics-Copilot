@@ -134,6 +134,10 @@ class Plot3DRequest(BaseModel):
     top_depth: Optional[float] = None
     bottom_depth: Optional[float] = None
     color_by: Optional[str] = "sweetspots"
+    highlight_top: Optional[float] = None
+    highlight_base: Optional[float] = None
+    highlight_label: Optional[str] = None
+    show_horizon: Optional[bool] = True
 
 
 @app.get("/health")
@@ -238,7 +242,11 @@ def plot_3d_cube_endpoint(req: Plot3DRequest):
 
 @app.post("/api/tools/plot_3d_trajectory")
 def plot_3d_trajectory_endpoint(req: Plot3DRequest):
-    return plot_3d_wellbore_trajectory(req.well_id, req.top_depth, req.bottom_depth, req.color_by)
+    return plot_3d_wellbore_trajectory(
+        req.well_id, req.top_depth, req.bottom_depth, req.color_by,
+        req.highlight_top, req.highlight_base, req.highlight_label,
+        req.show_horizon if req.show_horizon is not None else True
+    )
 
 
 @app.get("/api/tools/catalog")

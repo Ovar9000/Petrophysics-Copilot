@@ -1687,10 +1687,15 @@ def plot_3d_wellbore_trajectory(
     well_id: str,
     top_depth: Optional[float] = None,
     bottom_depth: Optional[float] = None,
-    color_by: Optional[str] = "sweetspots"
+    color_by: Optional[str] = "sweetspots",
+    highlight_top: Optional[float] = None,
+    highlight_base: Optional[float] = None,
+    highlight_label: Optional[str] = None,
+    show_horizon: bool = True
 ) -> Dict[str, Any]:
     """Generates an interactive 3D Subsurface Wellbore Trajectory with sweet spot pay zones,
-    dynamic trajectory attribute coloring (Sweet Spots, RDEEP, GR, TVDSS), and an expanded contoured reservoir horizon.
+    dynamic trajectory attribute coloring (Sweet Spots, RDEEP, GR, TVDSS), a contoured
+    geological reservoir horizon, and optional sweet-spot target beacon highlight.
     """
     las, df = read_las(well_id)
     cols = {c.upper(): c for c in df.columns}
@@ -1699,33 +1704,33 @@ def plot_3d_wellbore_trajectory(
         sub = sub[sub["DEPTH"] >= top_depth]
     if bottom_depth is not None:
         sub = sub[sub["DEPTH"] <= bottom_depth]
-        
+
     depths = sub["DEPTH"].values
     if len(depths) == 0:
         raise ValueError("No data samples available.")
-        
+
     tvd_col = cols.get("TVDSS") or cols.get("TVD")
     tvd = sub[tvd_col].values if tvd_col else -depths
-    
+
     d0 = depths[0]
     dev_x = 45.0 * np.sin((depths - d0) / 140.0)
     dev_y = 60.0 * (1.0 - np.cos((depths - d0) / 180.0))
     z = tvd
-    
+
     if "VSHALE" in cols:
         vsh = sub[cols["VSHALE"]].values
     elif "GR" in cols:
         vsh = np.clip((sub[cols["GR"]].values - 25.0) / 100.0, 0.0, 1.0)
     else:
         vsh = np.zeros(len(depths))
-        
+
     if "PHIE" in cols:
         phi = sub[cols["PHIE"]].values
     elif "DENB" in cols:
         phi = np.clip((2.65 - sub[cols["DENB"]].values) / 1.65, 0.0, 0.40)
     else:
         phi = np.full(len(depths), 0.15)
-        
+
     rdeep_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
     rdeep_vals = sub[rdeep_col].values if rdeep_col else np.full(len(depths), 10.0)
     rdeep_vals = np.maximum(rdeep_vals, 0.1)
@@ -1734,13 +1739,13 @@ def plot_3d_wellbore_trajectory(
         sw = sub[cols["SWE"]].values
     else:
         sw = np.sqrt(np.clip(0.05 / (np.maximum(phi, 0.01)**2.0 * rdeep_vals), 0.0, 1.0))
-        
+
     is_pay = (vsh <= 0.3) & (phi >= 0.10) & (sw <= 0.50) & (~np.isnan(depths))
-    
+
     fig = go.Figure()
 
     active_attr = (color_by or "sweetspots").lower()
-    
+
     if active_attr == "rdeep":
         log_r = np.log10(np.clip(rdeep_vals, 0.2, 2000.0))
         fig.add_trace(go.Scatter3d(
@@ -1809,7 +1814,7 @@ def plot_3d_wellbore_trajectory(
             line=dict(color="#94a3b8", width=3),
             name="Overburden / Non-Pay"
         ))
-        
+
         if np.any(is_pay):
             fig.add_trace(go.Scatter3d(
                 x=dev_x[is_pay],
@@ -1821,42 +1826,127 @@ def plot_3d_wellbore_trajectory(
                 name="Hydrocarbon Pay Zone (Sweet Spot)"
             ))
 
-    # Expanded 3D Reservoir Top Horizon Surface with Contours & Top Pick
-    if np.any(is_pay):
+    # ── Geological Reservoir Horizon ────────────────────────────────────────
+    if show_horizon and np.any(is_pay):
         pay_top_z = float(z[is_pay][0])
-        grid_x, grid_y = np.meshgrid(np.linspace(-150, 150, 30), np.linspace(-100, 200, 30))
-        # Add subtle geological dip (3.5m per 100m East, -2m per 100m North)
-        grid_z = pay_top_z + 0.035 * grid_x - 0.02 * grid_y
-        
+        gx, gy = np.meshgrid(np.linspace(-160, 160, 40), np.linspace(-120, 220, 40))
+        # Structural dip: 3.5 cm/m East (0.035), -2 cm/m North (−0.020)
+        dip_x, dip_y = 0.042, -0.025
+        # Realistic undulation: low-amplitude sinusoidal fault drag
+        undulation = (
+            3.5 * np.sin(gx / 80.0) * np.cos(gy / 110.0)
+            + 1.8 * np.sin(gx / 45.0 + 0.7)
+        )
+        gz = pay_top_z + dip_x * gx + dip_y * gy + undulation
+
         fig.add_trace(go.Surface(
-            x=grid_x,
-            y=grid_y,
-            z=grid_z,
-            opacity=0.35,
-            colorscale=[[0, "#38bdf8"], [1, "#0284c7"]],
-            showscale=False,
-            contours=dict(
-                x=dict(show=True, color="#0284c7", width=1),
-                y=dict(show=True, color="#0284c7", width=1),
-                z=dict(show=True, color="#0369a1", width=2, project=dict(z=False))
+            x=gx,
+            y=gy,
+            z=gz,
+            opacity=0.52,
+            colorscale="Earth",         # geological look
+            showscale=True,
+            colorbar=dict(
+                title=dict(text="<b>TVDSS (m)</b>", side="right"),
+                thickness=10,
+                len=0.45,
+                x=0.02,
+                xanchor="left",
+                tickfont=dict(size=9)
             ),
-            name="Target Reservoir Top Horizon"
+            contours=dict(
+                z=dict(show=True, usecolormap=True, width=1.5, project=dict(z=False))
+            ),
+            hovertemplate="Horizon TVDSS: %{z:.1f} m<extra>Top Reservoir Horizon</extra>",
+            name="Top Reservoir Horizon"
         ))
 
-        # Formation Top Label Marker
-        first_pay_idx = np.where(is_pay)[0][0]
+        # Elevated leader-line pin above the horizon
+        pin_x = float(dev_x[np.where(is_pay)[0][0]])
+        pin_y = float(dev_y[np.where(is_pay)[0][0]])
+        dip_deg = float(np.degrees(np.arctan(np.sqrt(dip_x**2 + dip_y**2))))
+        label_z_offset = abs(float(z.max() - z.min())) * 0.08 + 12.0
+
+        # Vertical leader line from horizon to label
         fig.add_trace(go.Scatter3d(
-            x=[dev_x[first_pay_idx]],
-            y=[dev_y[first_pay_idx]],
-            z=[pay_top_z],
+            x=[pin_x, pin_x],
+            y=[pin_y, pin_y],
+            z=[pay_top_z, pay_top_z - label_z_offset],
+            mode="lines",
+            line=dict(color="#f59e0b", width=2, dash="dot"),
+            showlegend=False,
+            hoverinfo="skip",
+            name="_horizon_leader"
+        ))
+
+        fig.add_trace(go.Scatter3d(
+            x=[pin_x],
+            y=[pin_y],
+            z=[pay_top_z - label_z_offset],
             mode="text+markers",
-            marker=dict(size=8, color="#0284c7", symbol="diamond"),
-            text=[f"Top Target Reservoir (~{abs(pay_top_z):.1f}m TVDSS)"],
+            marker=dict(size=9, color="#f59e0b", symbol="diamond", line=dict(color="#b45309", width=1.5)),
+            text=[f"<b>Marker: Top Reservoir Horizon</b><br>TVDSS ≈ {abs(pay_top_z):.1f} m | Dip: ~{dip_deg:.1f}° SE"],
             textposition="top center",
-            textfont=dict(color="#0f172a", size=11),
+            textfont=dict(color="#78350f", size=11, family="monospace"),
+            hoverinfo="text",
             name="Formation Top Pick"
         ))
-        
+
+    # ── Sweet Spot Highlight Beacon ──────────────────────────────────────────
+    if highlight_top is not None and highlight_base is not None:
+        # Find the wellbore segment indices for the full dataset (not filtered sub)
+        full_df = df.copy()
+        full_depths = full_df["DEPTH"].values
+        full_d0 = full_depths[0]
+        full_tvd_col = cols.get("TVDSS") or cols.get("TVD")
+        full_tvd = full_df[full_tvd_col].values if full_tvd_col else -full_depths
+        full_x = 45.0 * np.sin((full_depths - full_d0) / 140.0)
+        full_y = 60.0 * (1.0 - np.cos((full_depths - full_d0) / 180.0))
+
+        hl_mask = (full_depths >= highlight_top) & (full_depths <= highlight_base)
+        if np.any(hl_mask):
+            hx = full_x[hl_mask]
+            hy = full_y[hl_mask]
+            hz = full_tvd[hl_mask]
+
+            # Thick amber "glowing" segment
+            fig.add_trace(go.Scatter3d(
+                x=hx, y=hy, z=hz,
+                mode="markers+lines",
+                marker=dict(size=11, color="#f59e0b", opacity=1.0,
+                            line=dict(color="#fef3c7", width=2)),
+                line=dict(color="#d97706", width=10),
+                text=[f"🎯 TARGET SWEET SPOT<br>{highlight_label or ''}<br>MD: {d:.1f}m"
+                      for d in full_depths[hl_mask]],
+                hoverinfo="text",
+                name=f"🎯 Target: {highlight_label or 'Sweet Spot'}"
+            ))
+
+            # Callout beacon pin above the mid-point
+            mid_idx = len(hx) // 2
+            beacon_z = float(hz[mid_idx]) - abs(float(z.max() - z.min())) * 0.05
+
+            fig.add_trace(go.Scatter3d(
+                x=[float(hx[mid_idx])],
+                y=[float(hy[mid_idx])],
+                z=[beacon_z],
+                mode="text+markers",
+                marker=dict(size=14, color="#ef4444", symbol="circle",
+                            line=dict(color="#fca5a5", width=3)),
+                text=[f"<b>🎯 TARGET SWEET SPOT</b><br>{highlight_label or ''}<br>{highlight_top:.0f}m – {highlight_base:.0f}m MD"],
+                textposition="top center",
+                textfont=dict(color="#7f1d1d", size=12, family="monospace"),
+                hoverinfo="text",
+                name="Target Beacon"
+            ))
+
+            # Camera: orient toward mid-point of the highlight
+            eye_x = float(hx[mid_idx]) / max(abs(float(hx.max())), 1) * 2.0 + 1.2
+            eye_y = float(hy[mid_idx]) / max(abs(float(hy.max())), 1) * 2.0 + 1.2
+            fig.update_layout(
+                scene_camera=dict(eye=dict(x=eye_x, y=eye_y, z=0.85))
+            )
+
     fig.update_layout(
         title=f"<b>3D Subsurface Wellbore Trajectory: {well_id}</b> (Color by: {active_attr.upper()})",
         template="plotly_white",
@@ -1881,7 +1971,7 @@ def plot_3d_wellbore_trajectory(
         height=660,
         margin=dict(l=20, r=160, t=50, b=30),
     )
-    
+
     return {
         "well_id": well_id,
         "total_depth_samples": int(len(depths)),
@@ -1889,3 +1979,4 @@ def plot_3d_wellbore_trajectory(
         "color_by": active_attr,
         "figure_json": fig.to_json()
     }
+
