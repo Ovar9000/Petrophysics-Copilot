@@ -4,7 +4,6 @@ Replaces heavy external vector DB infrastructure with zero-latency, pure-Python
 structured search over LAS headers and geological reports.
 """
 
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 import lasio
 
@@ -68,31 +67,26 @@ def init_catalog() -> List[Dict[str, Any]]:
     return _CATALOG_CACHE
 
 
+def _score_item(query_words: List[str], item: Dict[str, Any]) -> int:
+    """Count query-word hits in the item corpus (length-normalized later if needed)."""
+    return sum(1 for w in query_words if w in item["search_corpus"])
+
+
 def query_catalog(query_text: str, well_name: Optional[str] = None) -> List[Dict[str, Any]]:
     """Instant keyword and relevance search across stratigraphy catalog."""
     global _CATALOG_CACHE
     if not _CATALOG_CACHE:
         init_catalog()
 
-    q_lower = query_text.lower()
-    q_words = [w for w in q_lower.split() if len(w) > 2]
-    
+    q_words = [w for w in query_text.lower().split() if len(w) > 2]
+
     scored: List[tuple[int, Dict[str, Any]]] = []
     for item in _CATALOG_CACHE:
         if well_name and well_name.lower() not in item["well_name"].lower():
             continue
 
-        score = 0
-        for w in q_words:
-            if w in item["search_corpus"]:
-                score += 1
-                
         clean_item = {k: v for k, v in item.items() if k != "search_corpus"}
-        scored.append((score, clean_item))
+        scored.append((_score_item(q_words, item), clean_item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [item for _, item in scored]
-
-
-# Initialize at import
-init_catalog()

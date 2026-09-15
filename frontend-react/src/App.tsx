@@ -12,7 +12,6 @@ export const App: React.FC = () => {
 
   // Visualization Deck State
   const [activeFigureJson, setActiveFigureJson] = useState<string | null>(null);
-  const [activeFigureType, setActiveFigureType] = useState<'1d' | '2d' | null>(null);
   const [netPayData, setNetPayData] = useState<NetPayKPIs | null>(null);
   const [sweetspotsData, setSweetspotsData] = useState<SweetspotScanResult | null>(null);
   const [citations, setCitations] = useState<Array<{ well_name: string; formation_tops: string; lithology_notes: string }>>([]);
@@ -21,11 +20,11 @@ export const App: React.FC = () => {
     {
       id: 'init-1',
       role: 'assistant',
-      content: `### 📍 Multi-Well Asset Workspace Ready
+      content: `### Multi-Well Asset Workspace Ready
 Both field wells are loaded in memory for integrated subsurface evaluation:
 
-* **📍 Well 1 (Target Alpha · 0–2500m MD)**: Prolific shoreface gas sandstone interval between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
-* **📍 Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration section featuring **28 stacked hydrocarbon sweet spots** between **3590m and 3850m**.
+* **Well 1 (Target Alpha · 0–2500m MD)**: Prolific shoreface gas sandstone interval between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
+* **Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration section featuring **28 stacked hydrocarbon sweet spots** between **3590m and 3850m**.
 
 Ask any question about either well individually, request a cross-well comparison (e.g. *"Compare the reservoir sweet spots in both Well 1 and Well 2"*), or explore interactive 1D log curves and 3D subsurface models on the right.`,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
@@ -99,15 +98,9 @@ Ask any question about either well individually, request a cross-well comparison
         });
       }
 
-      // Update active figure if returned
+      // Update active figure if returned (PlotlyDeck derives the kind from the figure spec)
       if (data.figures && data.figures.length > 0) {
-        const lastFig = data.figures[data.figures.length - 1];
-        setActiveFigureJson(lastFig);
-        if (text.toLowerCase().includes('crossplot')) {
-          setActiveFigureType('2d');
-        } else {
-          setActiveFigureType('1d');
-        }
+        setActiveFigureJson(data.figures[data.figures.length - 1]);
       }
 
       const botMsg: MessageItem = {
@@ -151,7 +144,6 @@ Ask any question about either well individually, request a cross-well comparison
       <div className="w-1/2 h-full flex flex-col">
         <PlotlyDeck
           activeFigureJson={activeFigureJson}
-          activeFigureType={activeFigureType}
           netPayData={netPayData}
           sweetspotsData={sweetspotsData}
           citations={citations}

@@ -1,4 +1,4 @@
-# 🗂️ Petrophysical Copilot: Autonomous Subsurface Analytics & RAG Engine
+# Petrophysical Copilot: Autonomous Subsurface Analytics & RAG Engine
 
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://python.org) [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com) [![React 18](https://img.shields.io/badge/Frontend-React%2018%20%7C%20TypeScript-61DAFB.svg?logo=react&logoColor=black)](https://react.dev) [![Plotly](https://img.shields.io/badge/Visualization-Plotly.js-3F4F75.svg?logo=plotly&logoColor=white)](https://plotly.com) [![Gemini](https://img.shields.io/badge/LLM-Google%20Gemini%20API-4285F4.svg?logo=google&logoColor=white)](https://ai.google.dev) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -6,7 +6,7 @@ An enterprise-grade, **hybrid agentic petrophysics platform** that pairs **Large
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 - [Core Capabilities: Real-Time Visualization, Retrieval & Computation](#core-capabilities-real-time-visualization-retrieval--computation)
 - [Architectural Overview](#architectural-overview)
@@ -21,7 +21,7 @@ An enterprise-grade, **hybrid agentic petrophysics platform** that pairs **Large
 
 ---
 
-## 🎯 Core Capabilities: Real-Time Visualization, Retrieval & Computation
+## Core Capabilities: Real-Time Visualization, Retrieval & Computation
 
 The platform is purpose-built to deliver **real-time visualization, retrieval, and computation of well log parameters directly from user natural language requests**:
 
@@ -34,7 +34,7 @@ The platform is purpose-built to deliver **real-time visualization, retrieval, a
 
 ---
 
-## 🏗️ Architectural Overview
+## Architectural Overview
 
 ```mermaid
 flowchart TB
@@ -69,7 +69,7 @@ flowchart TB
 
 ---
 
-## ⚙️ How the Backend Works
+## How the Backend Works
 
 The backend decouples **probabilistic reasoning** (LLM interpretation of intent) from **deterministic calculation** (petrophysical equations and spatial aggregations):
 
@@ -109,7 +109,7 @@ sequenceDiagram
 
 ---
 
-## 🛠️ Autonomous Tool Calling Engine
+## Autonomous Tool Calling Engine
 
 ### Why Deterministic Tool Calling?
 Language models struggle with precision floating-point calculations across tens of thousands of depth samples. Calculating cumulative reservoir pay over an interval of 5,000 depth rows requires strict mathematical evaluations:
@@ -124,7 +124,7 @@ Instead of asking the LLM to approximate mathematical values, **the LLM function
 
 ---
 
-## 🧰 Complete Tool Catalog & Parameter Specifications
+## Complete Tool Catalog & Parameter Specifications
 
 <details>
 <summary><b>1. <code>plot_1d_well_log</code> — Interactive Multi-Track Petrophysical Log</b></summary>
@@ -292,7 +292,7 @@ Queries the stratigraphy catalog for geological formations, stratigraphy tops, c
 
 ---
 
-## 🤖 Agent Workflow & Conversational Execution
+## Agent Workflow & Conversational Execution
 
 ### 1. Multi-Turn Autonomous Reasoning
 When a user asks a complex question (e.g. *"Evaluate the main reservoir in Well 2: calculate net pay, show the lithology crossplot, and check if any gas effect is present"*), the agent performs an autonomous multi-step reasoning plan:
@@ -307,13 +307,13 @@ Step 5: Synthesize executive summary with markdown, KPI highlights, and guidance
 
 ### 2. UI Synchronization & Active Well Binding
 The React interface keeps visual components synchronized with the agent:
-- **Badge Audit Trail**: Every tool invoked by the agent renders as a clickable, expandable badge (`⚙️ compute_net_pay`, `🔍 query_geology_metadata`) showing exact inputs and outputs.
+- **Badge Audit Trail**: Every tool invoked by the agent renders as a clickable, expandable badge (`compute_net_pay`, `query_geology_metadata`) showing exact inputs and outputs.
 - **Synchronized Tab Switching**: Invoking a 2D crossplot or 3D cube automatically surfaces the corresponding tab in the right-hand inspection deck.
 - **Active Well Binding**: Changing the selected well in the sidebar updates the context of the copilot. Clicking well toggles directly inside Plotly plots triggers cross-component synchronization.
 
 ---
 
-## ⚠️ Limitations & Petrophysical Boundary Conditions
+## Limitations & Petrophysical Boundary Conditions
 
 To maintain engineering integrity, users should note the following physical and system limitations:
 
@@ -342,7 +342,7 @@ To maintain engineering integrity, users should note the following physical and 
 
 ---
 
-## 🚀 Quick Start Guide
+## Quick Start Guide
 
 ### Prerequisites
 - **Python**: 3.10 or higher
@@ -391,7 +391,7 @@ Open your browser:
 
 ---
 
-## 🔌 MCP (Model Context Protocol) Integration
+## MCP (Model Context Protocol) Integration
 
 The platform includes a native **MCP Server** (`backend/mcp_server.py`) that exposes the entire deterministic petrophysical engine to external LLM clients such as **Claude Desktop**, **Cursor**, or **AI Sidecars**.
 
@@ -418,7 +418,7 @@ Once configured, Claude can autonomously execute petrophysical calculations, sli
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 ```
 well_log_rag_analytics/
@@ -458,6 +458,6 @@ well_log_rag_analytics/
 
 ---
 
-## 📄 License
+## License
 
 This project is licensed under the [MIT License](LICENSE).

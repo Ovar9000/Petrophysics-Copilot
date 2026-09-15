@@ -7,6 +7,57 @@ import remarkGfm from 'remark-gfm';
 const Plot = createPlotlyComponent(Plotly);
 
 const API_BASE = typeof window !== 'undefined' ? `http://${window.location.hostname}:8000` : 'http://127.0.0.1:8000';
+
+type PlotKind = '1d' | '2d' | '3d';
+
+// Backend stamps layout.meta.plot_kind on every figure; fall back to the old
+// content sniffing only for figures generated before the tag existed.
+const plotKindOf = (spec: any): PlotKind => {
+  const tagged = (spec?.layout as any)?.meta?.plot_kind;
+  if (tagged === '1d' || tagged === '2d' || tagged === '3d') return tagged;
+  const is3D = spec?.data?.some((d: any) => d.type === 'scatter3d' || d.type === 'surface' || d.type === 'mesh3d');
+  if (is3D) return '3d';
+  const title = spec?.layout?.title?.text ?? spec?.layout?.title ?? '';
+  return String(title).includes('Crossplot') || String(title).includes('Picket') ? '2d' : '1d';
+};
+
+// Single POST-JSON helper for all tool endpoints (replaces 7 copy-pasted fetches).
+const postTool = async <T,>(path: string, body: unknown): Promise<T | null> => {
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as T;
+  } catch (e) {
+    console.error(`POST ${path} failed:`, e);
+    return null;
+  }
+};
+
+// Shared Plotly chrome: white canvas, app font, no fixed size (fills container).
+const toLightLayout = (
+  spec: any,
+  uirevision: string,
+  opts: { margin?: any; legend?: any; plotBg?: boolean; hovermode?: string } = {}
+): any => {
+  const lightLayout: any = {
+    ...spec.layout,
+    autosize: true,
+    uirevision,
+    paper_bgcolor: '#FFFFFF',
+    font: { family: 'Inter, system-ui, sans-serif', color: '#334155', size: 11 },
+    ...(opts.margin !== undefined ? { margin: opts.margin } : {}),
+    ...(opts.legend !== undefined ? { legend: opts.legend } : {}),
+  };
+  if (opts.plotBg) lightLayout.plot_bgcolor = '#FFFFFF';
+  if (opts.hovermode) lightLayout.hovermode = opts.hovermode;
+  delete lightLayout.width;
+  delete lightLayout.height;
+  return lightLayout;
+};
 import { 
   LineChart, 
   ScatterChart, 
@@ -27,7 +78,6 @@ import { NetPayKPIs, SweetspotScanResult } from '../types';
 
 interface PlotlyDeckProps {
   activeFigureJson: string | null;
-  activeFigureType: '1d' | '2d' | null;
   netPayData: NetPayKPIs | null;
   sweetspotsData: SweetspotScanResult | null;
   citations: Array<{ well_name: string; formation_tops: string; lithology_notes: string }>;
@@ -97,33 +147,16 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     }
   }, [sweetspotsData]);
 
-  // React to figure emitted from chat
+  // React to figure emitted from chat (kind comes stamped from the backend)
   useEffect(() => {
     if (activeFigureJson) {
       try {
-        const spec = JSON.parse(activeFigureJson);
-        const is3D = spec.data?.some((d: any) => d.type === 'scatter3d' || d.type === 'surface' || d.type === 'mesh3d');
-        const isCrossplot = spec.layout?.title?.text?.includes('Crossplot') || spec.layout?.title?.includes?.('Crossplot');
-        
-        if (is3D) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [selectedWell]: { ...(prev[selectedWell] || {}), '3d': activeFigureJson }
-          }));
-          setActiveTab('3d');
-        } else if (isCrossplot) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [selectedWell]: { ...(prev[selectedWell] || {}), '2d': activeFigureJson }
-          }));
-          setActiveTab('2d');
-        } else {
-          setWellDataCache(prev => ({
-            ...prev,
-            [selectedWell]: { ...(prev[selectedWell] || {}), '1d': activeFigureJson }
-          }));
-          setActiveTab('1d');
-        }
+        const kind = plotKindOf(JSON.parse(activeFigureJson));
+        setWellDataCache(prev => ({
+          ...prev,
+          [selectedWell]: { ...(prev[selectedWell] || {}), [kind]: activeFigureJson }
+        }));
+        setActiveTab(kind);
       } catch {
         setActiveTab('1d');
       }
@@ -143,70 +176,46 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
 
     try {
       if (tab === '1d') {
-        const res = await fetch(`${API_BASE}/api/tools/plot_1d`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ well_id: well, top_depth: top, bottom_depth: bot })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.figure_json) {
-            setWellDataCache(prev => ({
-              ...prev,
-              [well]: { ...(prev[well] || {}), '1d': data.figure_json }
-            }));
-          }
+        const data = await postTool<{ figure_json?: string }>('/api/tools/plot_1d', { well_id: well, top_depth: top, bottom_depth: bot });
+        if (data?.figure_json) {
+          setWellDataCache(prev => ({
+            ...prev,
+            [well]: { ...(prev[well] || {}), '1d': data.figure_json as string }
+          }));
         }
       } else if (tab === '2d') {
-        const res = await fetch(`${API_BASE}/api/tools/crossplot`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            well_id: well,
-            x_curve: 'NEUT',
-            y_curve: 'DENB',
-            z_curve: 'GR',
-            top_depth: top,
-            bottom_depth: bot
-          })
+        const data = await postTool<{ figure_json?: string }>('/api/tools/crossplot', {
+          well_id: well,
+          x_curve: 'NEUT',
+          y_curve: 'DENB',
+          z_curve: 'GR',
+          top_depth: top,
+          bottom_depth: bot
         });
-        if (res.ok) {
-          const data = await res.json();
-          if (data.figure_json) {
-            setWellDataCache(prev => ({
-              ...prev,
-              [well]: { ...(prev[well] || {}), '2d': data.figure_json }
-            }));
-          }
+        if (data?.figure_json) {
+          setWellDataCache(prev => ({
+            ...prev,
+            [well]: { ...(prev[well] || {}), '2d': data.figure_json as string }
+          }));
         }
       } else if (tab === 'sweetspots') {
-        const res = await fetch(`${API_BASE}/api/tools/sweetspots`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ well_id: well, min_thickness: 1.5 })
-        });
-        if (res.ok) {
-          const data = await res.json();
+        const data = await postTool<SweetspotScanResult>('/api/tools/sweetspots', { well_id: well, min_thickness: 1.5 });
+        if (data) {
           setWellDataCache(prev => ({
             ...prev,
             [well]: { ...(prev[well] || {}), sweetspots: data }
           }));
         }
       } else if (tab === 'kpis') {
-        const res = await fetch(`${API_BASE}/api/tools/net_pay`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            well_id: well,
-            top_depth: top,
-            bottom_depth: bot,
-            vsh_cutoff: 0.3,
-            phi_cutoff: 0.1,
-            sw_cutoff: 0.5
-          })
+        const data = await postTool<NetPayKPIs>('/api/tools/net_pay', {
+          well_id: well,
+          top_depth: top,
+          bottom_depth: bot,
+          vsh_cutoff: 0.3,
+          phi_cutoff: 0.1,
+          sw_cutoff: 0.5
         });
-        if (res.ok) {
-          const data = await res.json();
+        if (data) {
           setWellDataCache(prev => ({
             ...prev,
             [well]: { ...(prev[well] || {}), kpis: data }
@@ -260,20 +269,13 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
         if (highlightBase !== undefined) body.highlight_base = highlightBase;
         if (highlightLabelStr !== undefined) body.highlight_label = highlightLabelStr;
       }
-      const res = await fetch(`${API_BASE}${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.figure_json) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), '3d': data.figure_json }
-          }));
-          setActiveTab('3d');
-        }
+      const data = await postTool<{ figure_json?: string }>(endpoint, body);
+      if (data?.figure_json) {
+        setWellDataCache(prev => ({
+          ...prev,
+          [well]: { ...(prev[well] || {}), '3d': data.figure_json as string }
+        }));
+        setActiveTab('3d');
       }
     } catch (e) {
       console.error('Failed to load 3D plot:', e);
@@ -314,19 +316,12 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     setDepthMax(bot);
     setLoadingTab(true);
     try {
-      const res = await fetch(`${API_BASE}/api/tools/plot_1d`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ well_id: selectedWell, top_depth: top, bottom_depth: bot })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.figure_json) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [selectedWell]: { ...(prev[selectedWell] || {}), '1d': data.figure_json }
-          }));
-        }
+      const data = await postTool<{ figure_json?: string }>('/api/tools/plot_1d', { well_id: selectedWell, top_depth: top, bottom_depth: bot });
+      if (data?.figure_json) {
+        setWellDataCache(prev => ({
+          ...prev,
+          [selectedWell]: { ...(prev[selectedWell] || {}), '1d': data.figure_json as string }
+        }));
       }
     } catch (e) {
       console.error('Failed to switch depth interval:', e);
@@ -374,9 +369,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     if (!rawJson) return null;
     try {
       const spec = JSON.parse(rawJson);
-      const is3D = spec.data?.some((d: any) => d.type === 'scatter3d' || d.type === 'surface' || d.type === 'mesh3d');
-      if (is3D) return null;
-      if (spec.layout?.title?.text?.includes('Crossplot') || spec.layout?.title?.includes?.('Crossplot')) return null;
+      if (plotKindOf(spec) !== '1d') return null;
 
       // Extract depth limits
       let dMin = selectedWell === 'Well1' ? 1850 : 3650;
@@ -398,18 +391,15 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
         ? depthMarker 
         : (spec.layout?.shapes?.[0]?.y0 ?? (selectedWell === 'Well1' ? 1908.0 : 3685.0));
 
-      const lightLayout = {
-        ...spec.layout,
-        autosize: true,
-        uirevision: `${selectedWell}-${Math.round(dMin)}-${Math.round(dMax)}`,
-        paper_bgcolor: '#FFFFFF',
-        plot_bgcolor: '#FFFFFF',
-        hovermode: 'y',
-        font: { family: 'Inter, system-ui, sans-serif', color: '#334155', size: 11 },
-        margin: spec.layout?.margin ? { ...spec.layout.margin, r: 120 } : { l: 60, r: 120, t: 112, b: 70 },
-      };
-      delete lightLayout.width;
-      delete lightLayout.height;
+      const lightLayout = toLightLayout(
+        spec,
+        `${selectedWell}-${Math.round(dMin)}-${Math.round(dMax)}`,
+        {
+          margin: spec.layout?.margin ? { ...spec.layout.margin, r: 120 } : { l: 60, r: 120, t: 112, b: 70 },
+          plotBg: true,
+          hovermode: 'y'
+        }
+      );
 
       Object.keys(lightLayout).forEach(key => {
         if (key.startsWith('xaxis') || key.startsWith('yaxis')) {
@@ -487,16 +477,9 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     if (!rawJson) return null;
     try {
       const spec = JSON.parse(rawJson);
-      const is3D = spec.data?.some((d: any) => d.type === 'scatter3d' || d.type === 'surface' || d.type === 'mesh3d');
-      if (is3D) return null;
+      if (plotKindOf(spec) === '3d') return null;
 
-      const lightLayout = {
-        ...spec.layout,
-        autosize: true,
-        uirevision: `${selectedWell}-2d`,
-        paper_bgcolor: '#FFFFFF',
-        plot_bgcolor: '#FFFFFF',
-        font: { family: 'Inter, system-ui, sans-serif', color: '#334155', size: 11 },
+      const lightLayout = toLightLayout(spec, `${selectedWell}-2d`, {
         margin: spec.layout?.margin || { l: 65, r: 110, t: 80, b: 55 },
         legend: spec.layout?.legend || {
           orientation: 'h',
@@ -508,10 +491,9 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
           bordercolor: '#E2E8F0',
           borderwidth: 1,
           font: { size: 10 }
-        }
-      };
-      delete lightLayout.width;
-      delete lightLayout.height;
+        },
+        plotBg: true
+      });
 
       return { data: spec.data, layout: lightLayout };
     } catch (e) {
@@ -533,12 +515,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       const targetKey = highlightedSweetspot
         ? `-${highlightedSweetspot.top}-${highlightedSweetspot.base}`
         : '-full';
-      const lightLayout = {
-        ...spec.layout,
-        autosize: true,
-        uirevision: `${selectedWell}-3d${targetKey}`,
-        paper_bgcolor: '#FFFFFF',
-        font: { family: 'Inter, system-ui, sans-serif', color: '#334155', size: 11 },
+      const lightLayout = toLightLayout(spec, `${selectedWell}-3d${targetKey}`, {
         margin: spec.layout?.margin || { l: 20, r: 160, t: 40, b: 20 },
         legend: spec.layout?.legend || {
           orientation: 'v',
@@ -550,32 +527,21 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
           bordercolor: '#E2E8F0',
           borderwidth: 1,
           font: { size: 10, color: '#334155' }
-        },
-        scene: {
-          ...(spec.layout?.scene || {}),
-          bgcolor: '#FAFAFA',
-          xaxis: { 
-            ...(spec.layout?.scene?.xaxis || {}), 
-            gridcolor: '#E2E8F0', 
-            zerolinecolor: '#CBD5E1', 
-            linecolor: '#94A3B8'
-          },
-          yaxis: { 
-            ...(spec.layout?.scene?.yaxis || {}), 
-            gridcolor: '#E2E8F0', 
-            zerolinecolor: '#CBD5E1', 
-            linecolor: '#94A3B8'
-          },
-          zaxis: { 
-            ...(spec.layout?.scene?.zaxis || {}), 
-            gridcolor: '#E2E8F0', 
-            zerolinecolor: '#CBD5E1', 
-            linecolor: '#94A3B8'
-          },
         }
+      });
+      const axisStyle = (ax: any) => ({
+        ...(ax || {}),
+        gridcolor: '#E2E8F0',
+        zerolinecolor: '#CBD5E1',
+        linecolor: '#94A3B8'
+      });
+      lightLayout.scene = {
+        ...(spec.layout?.scene || {}),
+        bgcolor: '#FAFAFA',
+        xaxis: axisStyle(spec.layout?.scene?.xaxis),
+        yaxis: axisStyle(spec.layout?.scene?.yaxis),
+        zaxis: axisStyle(spec.layout?.scene?.zaxis),
       };
-      delete lightLayout.width;
-      delete lightLayout.height;
       return { data: spec.data, layout: lightLayout };
     } catch (e) {
       console.error('Failed to parse 3D Plotly JSON:', e);
@@ -776,7 +742,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-[11px] text-slate-400 italic hidden xl:inline">
-                    💡 Click track to place line
+                    Click track to place line
                   </span>
                   <button
                     onClick={() => setDepthMarker(selectedWell === 'Well1' ? 1908.0 : 3685.0)}
@@ -1009,11 +975,10 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
               )}
             </div>
 
-            {/* 🎯 Active Target Locator Banner */}
+            {/* Active Target Locator Banner */}
             {highlightedSweetspot && activeTab === '3d' && (
               <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-amber-50 border-b border-amber-200 text-xs font-mono">
                 <div className="flex items-center gap-1.5 text-amber-800">
-                  <span className="text-base">🎯</span>
                   <span className="font-semibold">Target Located on 3D Wellbore:</span>
                   <span className="text-amber-700">{highlightedSweetspot.label}</span>
                 </div>

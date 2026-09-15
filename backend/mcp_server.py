@@ -4,7 +4,7 @@ Exposes deterministic subsurface calculation and visualization tools
 via the Model Context Protocol (MCP) for Claude Desktop, Cursor, or MCP clients.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Optional
 import json
 try:
     from mcp.server.mcpserver import MCPServer as MCP
@@ -54,13 +54,12 @@ def get_well_curves_summary(well_id: str) -> str:
 @mcp.tool()
 def plot_1d_well_log(
     well_id: str,
-    curves: Optional[List[str]] = None,
     top_depth: Optional[float] = None,
     bottom_depth: Optional[float] = None,
     marker_depth: Optional[float] = None
 ) -> str:
     """Generates an interactive 3-track petrophysical log plot (GR/Caliper, Resistivity, Density-Neutron crossover)."""
-    res = _plot_1d_well_log(well_id, curves, top_depth, bottom_depth, marker_depth)
+    res = _plot_1d_well_log(well_id, top_depth, bottom_depth, marker_depth)
     return json.dumps(res)
 
 

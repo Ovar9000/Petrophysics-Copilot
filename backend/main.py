@@ -1,7 +1,8 @@
 """FastAPI backend application for Petrophysical Copilot.
 """
 
-from typing import Any, Dict, List, Optional
+from contextlib import asynccontextmanager
+from typing import Dict, List, Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -25,10 +26,17 @@ from backend.petrophysics import (
 from backend.catalog import query_catalog, init_catalog
 from backend.agent import run_agent_turn
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_catalog()
+    yield
+
+
 app = FastAPI(
     title="Petrophysical Copilot API",
     version="2.0.0",
-    description="Streamlined, high-performance subsurface analytics engine."
+    description="Streamlined, high-performance subsurface analytics engine.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -38,11 +46,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-@app.on_event("startup")
-def startup_event():
-    init_catalog()
 
 
 class ChatRequest(BaseModel):
@@ -55,7 +58,6 @@ class ChatRequest(BaseModel):
 
 class Plot1DRequest(BaseModel):
     well_id: str
-    curves: Optional[List[str]] = None
     top_depth: Optional[float] = None
     bottom_depth: Optional[float] = None
     marker_depth: Optional[float] = None
@@ -129,7 +131,15 @@ class CompositeReportRequest(BaseModel):
     bottom_depth: float
 
 
+class PlotCubeRequest(BaseModel):
+    """3D petrophysical cluster cube — no trajectory/highlight options apply."""
+    well_id: str
+    top_depth: Optional[float] = None
+    bottom_depth: Optional[float] = None
+
+
 class Plot3DRequest(BaseModel):
+    """3D wellbore trajectory with optional sweet-spot highlight."""
     well_id: str
     top_depth: Optional[float] = None
     bottom_depth: Optional[float] = None
@@ -187,7 +197,7 @@ def curves_endpoint(well_id: str):
 
 @app.post("/api/tools/plot_1d")
 def plot_1d_endpoint(req: Plot1DRequest):
-    return plot_1d_well_log(req.well_id, req.curves, req.top_depth, req.bottom_depth, req.marker_depth)
+    return plot_1d_well_log(req.well_id, req.top_depth, req.bottom_depth, req.marker_depth)
 
 
 @app.post("/api/tools/crossplot")
@@ -236,7 +246,7 @@ def composite_report_endpoint(req: CompositeReportRequest):
 
 
 @app.post("/api/tools/plot_3d_cube")
-def plot_3d_cube_endpoint(req: Plot3DRequest):
+def plot_3d_cube_endpoint(req: PlotCubeRequest):
     return plot_3d_petrophysical_cube(req.well_id, req.top_depth, req.bottom_depth)
 
 

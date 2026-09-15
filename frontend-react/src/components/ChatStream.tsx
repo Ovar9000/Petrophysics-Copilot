@@ -1,14 +1,13 @@
 import React, { useState, useRef, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { 
-  ArrowUp, 
-  Terminal, 
-  ChevronDown, 
-  ChevronRight, 
+import {
+  ArrowUp,
+  Terminal,
+  ChevronDown,
+  ChevronRight,
   Loader2,
-  Database,
-  Cpu
+  Database
 } from 'lucide-react';
 import { MessageItem, ToolCallItem, WellData } from '../types';
 

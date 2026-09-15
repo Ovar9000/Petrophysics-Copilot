@@ -9,7 +9,9 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 PYTHON_EXE = BASE_DIR / ".venv" / "Scripts" / "python.exe"
-STREAMLIT_EXE = BASE_DIR / ".venv" / "Scripts" / "streamlit.exe"
+
+sys.path.insert(0, str(BASE_DIR))
+from backend.config import BACKEND_HOST, BACKEND_PORT, FRONTEND_PORT
 
 
 def main():
@@ -25,19 +27,19 @@ def main():
     subprocess.run([str(PYTHON_EXE), "-c", "from backend.catalog import init_catalog; init_catalog(); print('Catalog initialized.')"], cwd=str(BASE_DIR), check=True)
     
     # 2. Launch FastAPI backend
-    print("\n[2/3] Starting FastAPI Backend on http://127.0.0.1:8000 ...")
+    print(f"\n[2/3] Starting FastAPI Backend on http://{BACKEND_HOST}:{BACKEND_PORT} ...")
     backend_proc = subprocess.Popen(
-        [str(PYTHON_EXE), "-m", "uvicorn", "backend.main:app", "--host", "127.0.0.1", "--port", "8000"],
+        [str(PYTHON_EXE), "-m", "uvicorn", "backend.main:app", "--host", BACKEND_HOST, "--port", str(BACKEND_PORT)],
         cwd=str(BASE_DIR)
     )
-    
+
     time.sleep(2)
-    
+
     # 3. Launch React Dashboard
-    print("\n[3/3] Starting Modern React Studio Dashboard on http://localhost:3000 ...")
+    print(f"\n[3/3] Starting Modern React Studio Dashboard on http://localhost:{FRONTEND_PORT} ...")
     npx_cmd = "npx.cmd" if os.name == "nt" else "npx"
     frontend_proc = subprocess.Popen(
-        [npx_cmd, "vite", "--port", "3000", "--host"],
+        [npx_cmd, "vite", "--port", str(FRONTEND_PORT), "--host"],
         cwd=str(BASE_DIR / "frontend-react")
     )
     
@@ -46,8 +48,8 @@ def main():
 
     print("\n==================================================================")
     print(" Subsurface Petrophysical Studio is Live!")
-    print(" - Modern React Dashboard: http://localhost:3000")
-    print(" - FastAPI Swagger API Docs: http://127.0.0.1:8000/docs")
+    print(f" - Modern React Dashboard: http://localhost:{FRONTEND_PORT}")
+    print(f" - FastAPI Swagger API Docs: http://{BACKEND_HOST}:{BACKEND_PORT}/docs")
     print(" - Docker Compose Setup: run 'docker compose up --build'")
     print("==================================================================")
     print("\nPress Ctrl+C to terminate services.")

@@ -5,7 +5,6 @@ using Gemini with executive Notion/Linear formatting.
 """
 
 from typing import Any, Dict, List, Optional
-import json
 import httpx
 from backend.config import GEMINI_API_KEY, GEMINI_MODEL
 from backend.petrophysics import (
@@ -44,7 +43,6 @@ TOOLS_DEFINITIONS = [
             "type": "OBJECT",
             "properties": {
                 "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "curves": {"type": "ARRAY", "items": {"type": "STRING"}, "description": "List of curves to highlight"},
                 "top_depth": {"type": "NUMBER", "description": "Top depth interval in meters"},
                 "bottom_depth": {"type": "NUMBER", "description": "Bottom depth interval in meters"},
                 "marker_depth": {"type": "NUMBER", "description": "Optional depth (in meters) to draw a continuous horizontal correlation line across all 3 tracks."}
@@ -227,15 +225,15 @@ SYSTEM_PROMPT = """You are a Principal Subsurface Petrophysicist and Reservoir E
 
 Asset Overview:
 You have TWO active wells loaded in memory:
-1. 📍 Well 1 (Target Alpha): Complete 25-curve LAS dataset from 0m to 2500m MD. Key target is the high-porosity shoreface gas sandstone between 1850m and 1950m MD (primary sweet spot: 1906.1m – 1914.6m).
-2. 📍 Well 2 (Exploration Beta): Deep exploration log dataset from 1176m to 3960m MD. Key target interval is between 3590m and 3850m MD.
+1. Well 1 (Target Alpha): Complete 25-curve LAS dataset from 0m to 2500m MD. Key target is the high-porosity shoreface gas sandstone between 1850m and 1950m MD (primary sweet spot: 1906.1m – 1914.6m).
+2. Well 2 (Exploration Beta): Deep exploration log dataset from 1176m to 3960m MD. Key target interval is between 3590m and 3850m MD.
 
 Operational & Output Directives:
 1. CLEAR WELL DISTINCTION (CRITICAL):
    - Always make it unmistakably clear which well is being discussed.
    - Use clear visual headers in your response:
-     - `### 📍 Well 1 (Target Alpha · 0–2500m)`
-     - `### 📍 Well 2 (Exploration Beta · 1176–3960m)`
+      - `### Well 1 (Target Alpha · 0–2500m)`
+      - `### Well 2 (Exploration Beta · 1176–3960m)`
    - If the user asks a general question, does not name a specific well, or requests a comparison (e.g. "what are the sweet spots?", "what are the formation tops?", "compare reservoir quality", "what can you do?"), evaluate and present BOTH Well 1 and Well 2 with distinct sections.
    - If the user specifies one well (e.g., "Analyze Well 2"), focus on that well while clearly labeling it.
 
@@ -247,11 +245,11 @@ Operational & Output Directives:
 3. RIGOROUS GEOSCIENCE STANDARDS:
    - Always run the relevant tools to calculate real, quantitative values before drawing conclusions.
    - Structure evaluations into clean, professional sections:
-     - 🎯 Executive Petrophysical Summary
-     - 📊 Quantitative Reservoir Volumetrics
-     - 🔬 Multi-Log Crossover & Lithofacies Diagnostics (GR baseline, resistivity invasion, density-neutron gas crossover, acoustic response)
-     - 🌊 Fluid Saturation & Contacts (Archie Sw, So, BVH, GWC / Free Water Level)
-     - 🛠️ Production & Completion Engineering Strategy (Perforations, CBL-VDL, DST, draw-down)
+      - Executive Petrophysical Summary
+      - Quantitative Reservoir Volumetrics
+      - Multi-Log Crossover & Lithofacies Diagnostics (GR baseline, resistivity invasion, density-neutron gas crossover, acoustic response)
+      - Fluid Saturation & Contacts (Archie Sw, So, BVH, GWC / Free Water Level)
+      - Production & Completion Engineering Strategy (Perforations, CBL-VDL, DST, draw-down)
 """
 
 
@@ -266,7 +264,6 @@ def execute_tool(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optio
         elif name == "plot_1d_well_log":
             res = plot_1d_well_log(
                 well_id=args["well_id"],
-                curves=args.get("curves"),
                 top_depth=args.get("top_depth"),
                 bottom_depth=args.get("bottom_depth"),
                 marker_depth=args.get("marker_depth")
@@ -402,9 +399,7 @@ def run_agent_turn(query: str, chat_history: Optional[List[Dict[str, str]]] = No
     if not GEMINI_API_KEY:
         return _generate_executive_dossier(query, [], [])
         
-    models_to_try = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"]
-    seen = set()
-    models_to_try = [m for m in models_to_try if not (m in seen or seen.add(m))]
+    models_to_try = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"]))
 
     contents = []
     if chat_history:
@@ -516,11 +511,11 @@ def _generate_executive_dossier(
 
     # If general greeting / capabilities question
     if any(k in q for k in ["what can you do", "help", "who are you", "hello", "hi", "capabilities", "overview"]):
-        briefing = """### 📍 Unified Asset Workspace Overview
+        briefing = """### Unified Asset Workspace Overview
 We have two active wells loaded in our evaluation environment:
 
-* **📍 Well 1 (Target Alpha · 0–2500m MD)**: Complete 25-curve LAS suite targeting a prolific shoreface gas sandstone reservoir between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
-* **📍 Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration dataset targeting stacked reservoir sands between **3590m and 3850m**.
+* **Well 1 (Target Alpha · 0–2500m MD)**: Complete 25-curve LAS suite targeting a prolific shoreface gas sandstone reservoir between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
+* **Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration dataset targeting stacked reservoir sands between **3590m and 3850m**.
 
 #### Recommended Collaborative Workflows:
 1. **Cross-Well Sweet Spot Comparison**: Compare commercial net pay, porosity, and hydrocarbon pore volume (HCPV) across both wells.
@@ -551,7 +546,7 @@ We have two active wells loaded in our evaluation environment:
             if fig1:
                 figures.append(fig1)
 
-        multi_text = rf"""### 📍 Well 1 (Target Alpha · 0–2500m)
+        multi_text = rf"""### Well 1 (Target Alpha · 0–2500m)
 * **Primary Target Interval**: 1850.0m – 1950.0m MD (Shoreface Gas Sandstone)
 * **Delineated Sweet Spot**: 1906.1m – 1914.6m MD (**{w1_sweet.get('sweetspots', [{}])[0].get('thickness_m', 8.69):.2f}m** continuous net pay)
 * **Quantitative Reservoir Metrics**:
@@ -563,9 +558,9 @@ We have two active wells loaded in our evaluation environment:
 
 ---
 
-### 📍 Well 2 (Exploration Beta · 1176–3960m)
+### Well 2 (Exploration Beta · 1176–3960m)
 * **Primary Target Interval**: 3590.0m – 3850.0m MD (Deep Exploration Sands)
-* **Delineated Sweet Spots**: **{w2_sweet.get('total_sweetspots_found', 28)} distinct pay zones** totaling **{w2_sweet.get('total_cumulative_pay_m', 129.5):.2f}m** of net pay.
+* **Delineated Sweet Spots**: **{w2_sweet.get('total_sweetspots_found', 28)} distinct pay zones** totaling **{w2_sweet.get('total_pay_thickness_m', 129.5):.2f}m** of net pay.
 * **Top-Tier Sweet Spot**: 3668.7m – 3683.5m MD (**14.94m** continuous net pay)
 * **Quantitative Reservoir Metrics**:
   * Average Effective Porosity ($\Phi_e$): **{w2_comp.get('average_porosity', 0.19) * 100:.1f}%**
@@ -576,9 +571,9 @@ We have two active wells loaded in our evaluation environment:
 
 ---
 
-### 🔬 Comparative Petrophysical Summary
+### Comparative Petrophysical Summary
 * **Storage & Deliverability**: Well 1 displays superior matrix cleanliness ($V_{{sh}} \approx 2.6\%$) and higher intrinsic porosity ($22\%$), making it an ideal high-rate production candidate. Well 2 provides substantial cumulative hydrocarbon column across stacked intervals with extremely high hydrocarbon saturation ($S_{{hc}} > 94\%$).
-* **Fluid Regimes**: Both wells present pronounced gas butterfly crossovers on Density-Neutron logs and high deep resistivity ($R_t > 40\ \Omega\cdot\text{m}$).
+* **Fluid Regimes**: Both wells present pronounced gas butterfly crossovers on Density-Neutron logs and high deep resistivity ($R_t > 40\ \Omega\cdot\text{{m}}$).
 """
         return {
             "text": multi_text.strip(),
@@ -614,12 +609,12 @@ We have two active wells loaded in our evaluation environment:
     avg_k = comp_data.get("average_permeability_md", 73.2)
     fluid = comp_data.get("interpreted_fluid_regime", "Gas Sand (High Resistivity & Crossover)")
 
-    dossier_text = rf"""### 📍 {well_label}
+    dossier_text = rf"""### {well_label}
 
-#### 🎯 Executive Petrophysical Summary
+#### Executive Petrophysical Summary
 Multi-track log evaluation and automated reservoir zonation for **{well_id}** delineate a premier **{fluid}** across **{target_top:.2f}m – {target_bot:.2f}m**. The primary pay interval provides **{net_pay_m:.2f} m** of continuous net pay with an extraordinary Net-to-Gross (**NTG**) of **{ntg:.2f}** and an accumulated Hydrocarbon Pore Volume (**HCPV**) of **{hcpv:.2f} m**.
 
-#### 📊 Quantitative Reservoir Volumetrics
+#### Quantitative Reservoir Volumetrics
 | Petrophysical Parameter | Measured / Evaluated Value | Oilfield Benchmark | Status |
 | :--- | :--- | :--- | :--- |
 | **Evaluated Target Interval** | `{target_top:.2f} m – {target_bot:.2f} m` | Reservoir Section | Identified |
@@ -633,18 +628,18 @@ Multi-track log evaluation and automated reservoir zonation for **{well_id}** de
 | **Flow Capacity ($k \cdot h$)** | `**{kh:.1f} mD·m**` | > 100 mD·m High Flow | **Unrestricted Inflow** |
 | **Mean Intrinsic Permeability ($k$)** | `**{avg_k:.1f} mD**` | Timur Empirical Model | **Excellent Flow** |
 
-#### 🔬 Multi-Log Crossover & Lithofacies Diagnostics
+#### Multi-Log Crossover & Lithofacies Diagnostics
 - **Gamma Ray Deflection**: GR drops to an ultra-clean baseline (~26–34 API), verifying an absence of detrital clays and illite/smectite laminations.
 - **Deep vs. Shallow Resistivity Profile**: Deep resistivity ($R_{{deep}}$) spikes dramatically to **42–85 $\Omega\cdot$m**, displaying a distinctive positive invasion profile over shallow resistivity ($R_{{shal}}$), confirming mud-filtrate invasion into a highly permeable, hydrocarbon-bearing reservoir.
-- **Density-Neutron Gas Crossover**: Pronounced separation between Bulk Density ($\rho_b \approx 2.12\text{ g/cm}^3$) and Neutron Porosity ($\Phi_N \approx 0.11\text{ v/v}$) exhibits a classic **Gas Butterfly Crossover**, caused by hydrogen index reduction in the flushed zone.
-- **Sonic Acoustic Response**: Compressional travel time ($DT_{{comp}}$) averages ~82–88 $\mu\text{s/ft}$, aligning with high acoustic porosity in weakly consolidated, high-permeability sandstone.
+- **Density-Neutron Gas Crossover**: Pronounced separation between Bulk Density ($\rho_b \approx 2.12\text{{ g/cm}}^3$) and Neutron Porosity ($\Phi_N \approx 0.11\text{{ v/v}}$) exhibits a classic **Gas Butterfly Crossover**, caused by hydrogen index reduction in the flushed zone.
+- **Sonic Acoustic Response**: Compressional travel time ($DT_{{comp}}$) averages ~82–88 $\mu\text{{s/ft}}$, aligning with high acoustic porosity in weakly consolidated, high-permeability sandstone.
 
-#### 🌊 Fluid Saturation & Contacts
-Using calibrated Archie parameters ($a=1.0$, $m=2.0$, $n=2.0$, $R_w=0.05\ \Omega\cdot\text{m}$), computed water saturation drops to a minimum of **{sw_pct * 0.7:.1f}%**, signifying near-irreducible capillary water saturation ($S_{{wirr}}$). 
+#### Fluid Saturation & Contacts
+Using calibrated Archie parameters ($a=1.0$, $m=2.0$, $n=2.0$, $R_w=0.05\ \Omega\cdot\text{{m}}$), computed water saturation drops to a minimum of **{sw_pct * 0.7:.1f}%**, signifying near-irreducible capillary water saturation ($S_{{wirr}}$). 
 - **Bulk Volume Hydrocarbon (BVH)** peaks at **0.18–0.21 v/v**, indicating continuous hydrocarbon occupancy across primary pore throats.
 - **Free Water Level / Contact**: No transition zone is detected down to {target_bot:.1f}m; the lower bounding shale creates an effective capillary bottom seal.
 
-#### 🛠️ Production & Completion Engineering Strategy
+#### Production & Completion Engineering Strategy
 1. **Perforation Window**: Prioritize through-tubing perforations across **{target_top + 1.0:.1f}m – {target_bot - 0.5:.1f}m** using 6 SPF casing guns with $60^\circ$ phasing to minimize skin damage.
 2. **Drill-Stem Testing (DST)**: Set packer seat at **{target_top - 5.0:.1f}m** inside the competent capping shale to test flow rates and determine initial reservoir pressure ($P_i$).
 3. **Sand Control**: Given the high permeability ({avg_k:.1f} mD) and density-neutron separation, gravel packing or premium mesh screens are advised to mitigate sand migration during sustained high-rate gas flow.

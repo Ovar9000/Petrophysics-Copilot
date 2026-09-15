@@ -16,7 +16,12 @@ from backend.petrophysics import (
     compare_vshale_methods,
     calculate_archie_saturation,
     compute_sonic_porosity_wyllie,
-    scan_reservoir_sweetspots
+    scan_reservoir_sweetspots,
+    compute_permeability_timur_coates,
+    plot_crossplot_picket,
+    generate_reservoir_composite_report,
+    plot_3d_petrophysical_cube,
+    plot_3d_wellbore_trajectory,
 )
 from backend.catalog import query_catalog, init_catalog
 
@@ -98,7 +103,6 @@ def test_sweetspot_scanner():
 
 
 def test_permeability():
-    from backend.petrophysics import compute_permeability_timur_coates
     res = compute_permeability_timur_coates("Well1", top_depth=1850.0, bottom_depth=1950.0)
     assert "average_permeability_md" in res
     assert res["average_permeability_md"] > 0
@@ -108,7 +112,6 @@ def test_permeability():
 
 
 def test_picket_plot():
-    from backend.petrophysics import plot_crossplot_picket
     res = plot_crossplot_picket("Well1", top_depth=1850.0, bottom_depth=1950.0)
     assert "samples_plotted" in res
     assert res["samples_plotted"] > 0
@@ -117,7 +120,6 @@ def test_picket_plot():
 
 
 def test_reservoir_composite_report():
-    from backend.petrophysics import generate_reservoir_composite_report
     res = generate_reservoir_composite_report("Well1", top_depth=1900.0, bottom_depth=1925.0)
     assert res["net_pay_m"] > 0
     assert res["hydrocarbon_pore_volume_hcpv_m"] > 0
@@ -126,7 +128,6 @@ def test_reservoir_composite_report():
 
 
 def test_3d_cube():
-    from backend.petrophysics import plot_3d_petrophysical_cube
     res = plot_3d_petrophysical_cube("Well1", top_depth=1850.0, bottom_depth=1950.0)
     assert res["samples_rendered"] > 0
     assert "figure_json" in res
@@ -134,7 +135,6 @@ def test_3d_cube():
 
 
 def test_3d_trajectory():
-    from backend.petrophysics import plot_3d_wellbore_trajectory
     res = plot_3d_wellbore_trajectory("Well1", top_depth=1850.0, bottom_depth=1950.0)
     assert res["total_depth_samples"] > 0
     assert "figure_json" in res

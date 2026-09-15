@@ -6,7 +6,6 @@ using lasio, pandas, numpy, and plotly.
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import json
 import lasio
 import numpy as np
 import pandas as pd
@@ -30,7 +29,7 @@ def _find_las_path(well_id: str) -> Path:
         if p.exists() and p.is_file():
             return p
     for p in DATA_DIR.glob("*.las"):
-        if p.stem.lower() == clean_id.lower() or p.stem.lower() in clean_id.lower() or clean_id.lower() in p.stem.lower():
+        if p.stem.lower() == clean_id.lower():
             return p
     raise FileNotFoundError(f"LAS file for well '{well_id}' not found in {DATA_DIR}")
 
@@ -152,7 +151,189 @@ def _calc_crossover_polygons(
     return all_x, all_y
 
 
-def plot_1d_well_log(well_id: str, curves: Optional[List[str]] = None, top_depth: Optional[float] = None, bottom_depth: Optional[float] = None, marker_depth: Optional[float] = None) -> Dict[str, Any]:
+# ----------------------------------------------------------------------------
+# Shared petrophysical constants & derivation helpers.
+# derive_vsh_phi_sw() below is the single source of truth for the Vsh/Phi/Sw
+# chain — every tool needing these curves calls it instead of re-implementing it.
+# ----------------------------------------------------------------------------
+RHO_MA = 2.65            # matrix (quartz) density, g/cc
+RHO_F = 1.0              # fluid density, g/cc
+# NOTE: kept as the literal 1.65 (== RHO_MA - RHO_F) because float(RHO_MA - RHO_F)
+# differs from literal 1.65 in the last bit; the literal matches all call sites.
+DENSITY_POROSITY_DIVISOR = 1.65
+LARIONOV_A = 0.083       # Larionov tertiary-shale coefficients
+LARIONOV_B = 3.7
+ARCHIE_RW_EFF = 0.05     # effective a*Rw product for the Archie-type Sw estimate
+VSH_CUTOFF = 0.3
+PHI_CUTOFF = 0.10
+SW_CUTOFF = 0.50
+DEFAULT_MARKER_DEPTH = {"well1": 1908.0, "well2": 3650.0}
+# Mineral matrix trendline colors (single cluster where a palette pays off;
+# other charts reuse blues/reds with different local meanings, so they stay local)
+MATRIX_COLORS = {"sandstone": "#eab308", "limestone": "#0284c7", "dolomite": "#dc2626"}
+
+
+def _gr_doorposts(gr: np.ndarray) -> Tuple[float, float]:
+    """P5/P95 GR doorposts for Larionov Vsh, with fallbacks for thin data."""
+    if np.sum(~np.isnan(gr)) > 10:
+        return float(np.nanpercentile(gr, 5)), float(np.nanpercentile(gr, 95))
+    return 20.0, 120.0
+
+
+def _larionov_vsh(gr: np.ndarray, gr_clean: float, gr_shale: float) -> np.ndarray:
+    igr = np.clip((gr - gr_clean) / max(gr_shale - gr_clean, 1.0), 0.0, 1.0)
+    return LARIONOV_A * (np.power(2.0, LARIONOV_B * igr) - 1.0)
+
+
+def _linear_vsh(gr: np.ndarray) -> np.ndarray:
+    return np.clip((gr - 25.0) / 100.0, 0.0, 1.0)
+
+
+def _density_phi(rhob: np.ndarray, lo: float = 0.0, hi: float = 0.45) -> np.ndarray:
+    return np.clip((RHO_MA - rhob) / DENSITY_POROSITY_DIVISOR, lo, hi)
+
+
+def _archie_type_sw(phi: np.ndarray, rdeep: np.ndarray,
+                   rw_eff: float = ARCHIE_RW_EFF) -> np.ndarray:
+    return np.sqrt(np.clip(
+        rw_eff / (np.maximum(phi, 0.01) ** 2.0 * np.maximum(rdeep, 0.1)), 0.0, 1.0))
+
+
+def _mean_or_zero(a: np.ndarray, mask: np.ndarray, ndigits: int = 4) -> float:
+    """Mean over mask, or 0.0 when nothing passes (the no-pay business rule)."""
+    if np.any(mask):
+        return round(float(np.nanmean(a[mask])), ndigits)
+    return 0.0
+
+
+def _perm_quality_class(avg_k: float) -> str:
+    """Reservoir quality bucket from mean permeability."""
+    if avg_k > 100:
+        return "Excellent (>100 mD)"
+    if avg_k > 10:
+        return "Good (10-100 mD)"
+    return "Fair/Tight (<10 mD)"
+
+
+def _tag(fig: go.Figure, plot_kind: str) -> go.Figure:
+    """Stamp the figure kind into layout.meta for the frontend tab router."""
+    fig.update_layout(meta={"plot_kind": plot_kind})
+    return fig
+
+
+def _classify_fluid(avg_sw: float, avg_phi: float) -> str:
+    """Fluid regime from pay-zone averages (gas needs low Sw *and* good rock)."""
+    if avg_sw < 0.35 and avg_phi > 0.15:
+        return "Gas Sand (High Resistivity & Crossover)"
+    if avg_sw < 0.50:
+        return "Hydrocarbon Sand"
+    return "Water Sand / Wet Formation"
+
+
+def _dejitter_quantized(x: np.ndarray, thresh: float = 0.8, sigma: float = 0.22,
+                        seed: int = 42) -> np.ndarray:
+    """Spread integer-binned values (e.g. quantized neutron porosity) with slight
+    Gaussian noise so dense vertical stripes read as a cloud. No-op otherwise."""
+    unique_diffs = np.diff(np.sort(np.unique(np.round(x, 2))))
+    if len(unique_diffs) > 0 and np.median(unique_diffs) >= thresh:
+        rng = np.random.default_rng(seed)
+        return x + rng.normal(0.0, sigma, size=len(x))
+    return x
+
+
+def _contiguous_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+    """Inclusive (start, end) index runs where mask is True (numpy diff idiom)."""
+    m = np.asarray(mask, dtype=bool)
+    if m.size == 0 or not np.any(m):
+        return []
+    diff = np.diff(m.astype(int))
+    starts = list(np.where(diff == 1)[0] + 1)
+    if m[0]:
+        starts = [0] + starts
+    ends = list(np.where(diff == -1)[0])
+    if m[-1]:
+        ends = ends + [len(m) - 1]
+    return list(zip(starts, ends))
+
+
+def _base_layout(title: str) -> Dict[str, Any]:
+    """Shared figure chrome for the single-panel 2D depth tools."""
+    return dict(
+        title=title,
+        template="plotly_white",
+        height=620,
+        margin=dict(l=55, r=25, t=60, b=50),
+    )
+
+
+def derive_vsh_phi_sw(
+    frame: pd.DataFrame,
+    cols: Dict[str, str],
+    *,
+    gr_method: str = "larionov",
+    phi_clip: Tuple[float, float] = (0.0, 0.45),
+    phi_default: float = 0.15,
+    sw_default: float = 1.0,
+    den_candidates: Tuple[str, ...] = ("DENB", "RHOB"),
+    rdeep_candidates: Tuple[str, ...] = ("RDEEP",),
+    rdeep_default: Optional[float] = None,
+    use_vshale_log: bool = True,
+    use_swe_log: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, str]]:
+    """Derive Vsh/Phi/Sw for a depth frame.
+
+    Returns (vsh, phi, sw, methods); methods names the branch that fired per
+    property so callers can build audit footnotes. Math matches the historical
+    per-tool expressions exactly.
+    """
+    n = len(frame)
+    methods: Dict[str, str] = {}
+
+    if use_vshale_log and "VSHALE" in cols:
+        vsh = frame[cols["VSHALE"]].values
+        methods["vsh"] = f"Vsh from {cols['VSHALE']} log direct"
+    elif "GR" in cols and gr_method != "none":
+        gr = frame[cols["GR"]].values
+        if gr_method == "larionov":
+            gr_clean, gr_shale = _gr_doorposts(gr)
+            vsh = _larionov_vsh(gr, gr_clean, gr_shale)
+            methods["vsh"] = (f"Vsh from GR via Larionov-T "
+                              f"(GRclean P5={gr_clean:.0f} / GRshale P95={gr_shale:.0f} API)")
+        else:
+            vsh = _linear_vsh(gr)
+            methods["vsh"] = "Vsh from GR linear baseline (25/125 API)"
+    else:
+        vsh = np.zeros(n)
+        methods["vsh"] = "Vsh = 0 assumed (no GR/VSHALE)"
+
+    den_col = next((cols[c] for c in den_candidates if c in cols), None)
+    if "PHIE" in cols:
+        phi = frame[cols["PHIE"]].values
+        methods["phi"] = f"Porosity from {cols['PHIE']} log direct"
+    elif den_col is not None:
+        phi = _density_phi(frame[den_col].values, *phi_clip)
+        methods["phi"] = f"Porosity from density ({den_col}, rho_ma 2.65 / rho_f 1.0)"
+    else:
+        phi = np.full(n, phi_default)
+        methods["phi"] = f"Porosity = {phi_default:g} assumed (no PHIE/DENB)"
+
+    if use_swe_log and "SWE" in cols:
+        sw = frame[cols["SWE"]].values
+        methods["sw"] = f"Sw from {cols['SWE']} log direct"
+    else:
+        rdeep_col = next((cols[c] for c in rdeep_candidates if c in cols), None)
+        if rdeep_col is None and rdeep_default is None:
+            sw = np.full(n, sw_default)
+            methods["sw"] = f"Sw = {sw_default:g} assumed (no SWE/RDEEP)"
+        else:
+            rdeep = frame[rdeep_col].values if rdeep_col else np.full(n, rdeep_default)
+            sw = _archie_type_sw(phi, rdeep)
+            methods["sw"] = "Sw via Archie-type (a·Rw 0.05, m = n = 2)"
+
+    return vsh, phi, sw, methods
+
+
+def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_depth: Optional[float] = None, marker_depth: Optional[float] = None) -> Dict[str, Any]:
     """Slices the .las depth range using pandas and returns an interactive multi-track Plotly figure."""
     las, df = read_las(well_id)
     
@@ -300,57 +481,11 @@ def plot_1d_well_log(well_id: str, curves: Optional[List[str]] = None, top_depth
         v_depth = depth[v_mask]
         v_den = den_vals[v_mask]
         v_neut = neut_rho_equiv[v_mask]
-        crossover_mask = (v_den < v_neut)
+        # Same polygon builder as the caliper washout/mudcake fills above
+        all_poly_x, all_poly_y = _calc_crossover_polygons(
+            v_depth, v_den, v_neut, condition_gt=False)
 
-        if np.any(crossover_mask):
-            diff = np.diff(crossover_mask.astype(int))
-            starts = np.where(diff == 1)[0] + 1
-            if crossover_mask[0]:
-                starts = np.r_[0, starts]
-            ends = np.where(diff == -1)[0]
-            if crossover_mask[-1]:
-                ends = np.r_[ends, len(crossover_mask) - 1]
-
-            all_poly_x: List[Optional[float]] = []
-            all_poly_y: List[Optional[float]] = []
-
-            for s, e in zip(starts, ends):
-                seg_d = list(v_depth[s:e+1])
-                seg_den = list(v_den[s:e+1])
-                seg_neut = list(v_neut[s:e+1])
-
-                # Interpolate exact crossover entry point
-                start_pt_x: List[float] = []
-                start_pt_y: List[float] = []
-                if s > 0:
-                    d_den = v_den[s] - v_den[s-1]
-                    d_neut = v_neut[s] - v_neut[s-1]
-                    denom = d_den - d_neut
-                    if abs(denom) > 1e-6:
-                        t = (v_neut[s-1] - v_den[s-1]) / denom
-                        if 0.0 <= t <= 1.0:
-                            start_pt_y = [float(v_depth[s-1] + t * (v_depth[s] - v_depth[s-1]))]
-                            start_pt_x = [float(v_den[s-1] + t * d_den)]
-
-                # Interpolate exact crossover exit point
-                end_pt_x: List[float] = []
-                end_pt_y: List[float] = []
-                if e < len(v_depth) - 1:
-                    d_den = v_den[e+1] - v_den[e]
-                    d_neut = v_neut[e+1] - v_neut[e]
-                    denom = d_den - d_neut
-                    if abs(denom) > 1e-6:
-                        t = (v_neut[e] - v_den[e]) / denom
-                        if 0.0 <= t <= 1.0:
-                            end_pt_y = [float(v_depth[e] + t * (v_depth[e+1] - v_depth[e]))]
-                            end_pt_x = [float(v_den[e] + t * d_den)]
-
-                poly_x = start_pt_x + seg_den + end_pt_x + seg_neut[::-1] + start_pt_x
-                poly_y = start_pt_y + seg_d + end_pt_y + seg_d[::-1] + start_pt_y
-                all_poly_x.extend(poly_x + [None])
-                all_poly_y.extend(poly_y + [None])
-
-            if all_poly_x:
+        if all_poly_x:
                 fig.add_trace(
                     go.Scatter(
                         x=all_poly_x, y=all_poly_y,
@@ -400,7 +535,7 @@ def plot_1d_well_log(well_id: str, curves: Optional[List[str]] = None, top_depth
     
     # 1 Continuous Horizontal Line across all 3 graphs (xref='paper', yref='y')
     if marker_depth is None:
-        candidate = 1908.0 if "1" in str(well_id) else 3650.0
+        candidate = DEFAULT_MARKER_DEPTH.get(str(well_id).lower(), 1908.0)
         if min_d <= candidate <= max_d:
             marker_depth = candidate
         else:
@@ -519,7 +654,7 @@ def plot_1d_well_log(well_id: str, curves: Optional[List[str]] = None, top_depth
         "well_id": well_id,
         "top_depth": min_d,
         "bottom_depth": max_d,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "1d").to_json(),
         "summary": f"Generated 3-track composite log for {well_title} across {min_d:.1f}m - {max_d:.1f}m."
     }
 
@@ -557,12 +692,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
             x_vals = x_vals * 100.0
         # Explicit axis title so readers don't need domain knowledge to parse units
         x_title = "Neutron Porosity — NPHI (%)"
-        # Detect artificial quantization (e.g. integer-binned neutron porosities) and apply slight Gaussian jitter
-        rounded_x = np.round(x_vals, 2)
-        unique_diffs = np.diff(np.sort(np.unique(rounded_x)))
-        if len(unique_diffs) > 0 and np.median(unique_diffs) >= 0.8:
-            rng = np.random.default_rng(42)
-            x_vals = x_vals + rng.normal(0.0, 0.22, size=len(x_vals))
+        x_vals = _dejitter_quantized(x_vals)
     else:
         x_title = x_actual
 
@@ -625,9 +755,9 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
     if is_rhob_nphi:
         fig.update_yaxes(autorange="reversed")
         phi_pts = np.array([0, 10, 20, 30, 40])
-        fig.add_trace(go.Scatter(x=phi_pts, y=2.65 - (phi_pts / 100.0) * 1.65, mode="lines+markers", name="Sandstone (2.65)", line=dict(color="#eab308", dash="dash")))
-        fig.add_trace(go.Scatter(x=phi_pts, y=2.71 - (phi_pts / 100.0) * 1.71, mode="lines+markers", name="Limestone (2.71)", line=dict(color="#0284c7", dash="dash")))
-        fig.add_trace(go.Scatter(x=phi_pts, y=2.87 - (phi_pts / 100.0) * 1.87, mode="lines+markers", name="Dolomite (2.87)", line=dict(color="#dc2626", dash="dash")))
+        fig.add_trace(go.Scatter(x=phi_pts, y=2.65 - (phi_pts / 100.0) * 1.65, mode="lines+markers", name="Sandstone (2.65)", line=dict(color=MATRIX_COLORS["sandstone"], dash="dash")))
+        fig.add_trace(go.Scatter(x=phi_pts, y=2.71 - (phi_pts / 100.0) * 1.71, mode="lines+markers", name="Limestone (2.71)", line=dict(color=MATRIX_COLORS["limestone"], dash="dash")))
+        fig.add_trace(go.Scatter(x=phi_pts, y=2.87 - (phi_pts / 100.0) * 1.87, mode="lines+markers", name="Dolomite (2.87)", line=dict(color=MATRIX_COLORS["dolomite"], dash="dash")))
 
         # Endmember callout annotations at zero porosity
         annotations = [
@@ -731,7 +861,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
     
     return {
         "well_id": well_id,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "2d").to_json(),
         "data_points": len(sub_df),
         "summary": f"Generated 2D crossplot with {len(sub_df)} points for {well_title}."
     }
@@ -756,45 +886,9 @@ def compute_net_pay(
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     cols = {c.upper(): c for c in sub_df.columns}
     
-    # 1. Vsh (track the method for the audit footnote)
-    if "VSHALE" in cols:
-        vsh = sub_df[cols["VSHALE"]].values
-        vsh_method = f"Vsh from {cols['VSHALE']} log direct"
-    elif "GR" in cols:
-        gr = sub_df[cols["GR"]].values
-        gr_clean = float(np.nanpercentile(gr, 5)) if np.sum(~np.isnan(gr)) > 10 else 20.0
-        gr_shale = float(np.nanpercentile(gr, 95)) if np.sum(~np.isnan(gr)) > 10 else 120.0
-        igr = np.clip((gr - gr_clean) / max(gr_shale - gr_clean, 1.0), 0.0, 1.0)
-        vsh = 0.083 * (np.power(2.0, 3.7 * igr) - 1.0)
-        vsh_method = (f"Vsh from GR via Larionov-T "
-                      f"(GRclean P5={gr_clean:.0f} / GRshale P95={gr_shale:.0f} API)")
-    else:
-        vsh = np.zeros(len(depths))
-        vsh_method = "Vsh = 0 assumed (no GR/VSHALE)"
-
-    # 2. Porosity
-    if "PHIE" in cols:
-        phi = sub_df[cols["PHIE"]].values
-        phi_method = f"Porosity from {cols['PHIE']} log direct"
-    elif "DENB" in cols or "RHOB" in cols:
-        den_col = cols.get("DENB") or cols.get("RHOB")
-        phi = np.clip((2.65 - sub_df[den_col].values) / (2.65 - 1.0), 0.0, 0.45)
-        phi_method = f"Porosity from density ({den_col}, rho_ma 2.65 / rho_f 1.0)"
-    else:
-        phi = np.full(len(depths), 0.15)
-        phi_method = "Porosity = 0.15 assumed (no PHIE/DENB)"
-
-    # 3. Water Saturation
-    if "SWE" in cols:
-        sw = sub_df[cols["SWE"]].values
-        sw_method = f"Sw from {cols['SWE']} log direct"
-    elif "RDEEP" in cols:
-        rdeep = np.maximum(sub_df[cols["RDEEP"]].values, 0.1)
-        sw = np.sqrt(np.clip((1.0 * 0.05) / (np.maximum(phi, 0.01)**2.0 * rdeep), 0.0, 1.0))
-        sw_method = "Sw via Archie-type (a·Rw 0.05, m = n = 2)"
-    else:
-        sw = np.ones(len(depths))
-        sw_method = "Sw = 1 assumed (no SWE/RDEEP)"
+    # Shared Vsh/Phi/Sw derivation (Larionov Vsh, density porosity, Archie-type Sw)
+    vsh, phi, sw, methods = derive_vsh_phi_sw(sub_df, cols)
+    vsh_method, phi_method, sw_method = methods["vsh"], methods["phi"], methods["sw"]
 
     valid = (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw))
     is_res = (vsh <= vsh_cutoff) & (phi >= phi_cutoff) & valid
@@ -873,9 +967,9 @@ def compute_net_pay(
         "net_to_gross": ntg,
         "reservoir_to_gross": res_to_gross,
         "pay_zone_averages": {
-            "average_porosity": round(float(np.nanmean(phi[is_pay])) if np.any(is_pay) else 0.0, 4),
-            "average_water_saturation": round(float(np.nanmean(sw[is_pay])) if np.any(is_pay) else 0.0, 4),
-            "average_shale_volume": round(float(np.nanmean(vsh[is_pay])) if np.any(is_pay) else 0.0, 4),
+            "average_porosity": _mean_or_zero(phi, is_pay),
+            "average_water_saturation": _mean_or_zero(sw, is_pay),
+            "average_shale_volume": _mean_or_zero(vsh, is_pay),
         },
         "cum_pay_curve": cum_pay_curve,
         "facies_breakdown": facies_breakdown,
@@ -938,7 +1032,7 @@ def compare_vshale_methods(well_id: str, top_depth: float, bottom_depth: float) 
         "well_id": well_id,
         "top_depth": top_depth,
         "bottom_depth": bottom_depth,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "1d").to_json(),
         "averages": {
             "linear_avg": round(float(np.mean(igr)), 4),
             "larionov_avg": round(float(np.mean(vsh_larionov)), 4),
@@ -966,14 +1060,10 @@ def calculate_archie_saturation(
     depths = sub["DEPTH"].values
     cols = {c.upper(): c for c in sub.columns}
     
-    # Porosity
-    if "PHIE" in cols:
-        phi = sub[cols["PHIE"]].values
-    elif "DENB" in cols:
-        phi = np.clip((2.65 - sub[cols["DENB"]].values) / 1.65, 0.0, 0.45)
-    else:
-        phi = np.full(len(depths), 0.20)
-        
+    # Porosity (shared derivation; Archie Sw below stays tool-specific)
+    _, phi, _, _methods = derive_vsh_phi_sw(
+        sub, cols, phi_default=0.20, den_candidates=("DENB",))
+
     # Resistivity
     r_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
     rt = sub[r_col].values if r_col else np.full(len(depths), 10.0)
@@ -999,16 +1089,13 @@ def calculate_archie_saturation(
     fig.update_xaxes(title_text="Saturation (%)", range=[0, 100], row=1, col=1)
     fig.update_xaxes(title_text="BVH (v/v)", range=[0, 0.25], row=1, col=2)
     
-    fig.update_layout(
+    fig.update_layout(_base_layout(
         title=f"<b>Archie Saturation & Hydrocarbon Volume: {well_id}</b> (Rw={rw}, m={m}, n={n})",
-        template="plotly_white",
-        height=620,
-        margin=dict(l=55, r=25, t=60, b=50),
-    )
+    ))
     
     return {
         "well_id": well_id,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "1d").to_json(),
         "average_sw": round(float(np.nanmean(sw)), 4),
         "average_shc": round(float(np.nanmean(shc)), 4),
         "average_bvh": round(float(np.nanmean(bvh)), 4),
@@ -1053,16 +1140,13 @@ def compute_sonic_porosity_wyllie(
     fig.update_xaxes(title_text="DT (us/ft)", range=[40, 140], row=1, col=1)
     fig.update_xaxes(title_text="Porosity (%)", range=[0, 40], row=1, col=2)
     
-    fig.update_layout(
+    fig.update_layout(_base_layout(
         title=f"<b>Sonic Petrophysics: Wyllie Porosity ({well_id})</b>",
-        template="plotly_white",
-        height=620,
-        margin=dict(l=55, r=25, t=60, b=50),
-    )
+    ))
     
     return {
         "well_id": well_id,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "1d").to_json(),
         "avg_sonic_porosity": round(float(np.nanmean(phi_sonic)), 4),
         "dt_matrix": dt_matrix,
         "dt_fluid": dt_fluid
@@ -1077,63 +1161,37 @@ def scan_reservoir_sweetspots(well_id: str, min_thickness: float = 1.5) -> Dict[
     depths = df["DEPTH"].values
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     
-    # Derive Vsh, Phi, Sw across entire well
-    if "VSHALE" in cols:
-        vsh = df[cols["VSHALE"]].values
-    elif "GR" in cols:
-        gr = df[cols["GR"]].values
-        vsh = np.clip((gr - 25.0) / 100.0, 0.0, 1.0)
-    else:
-        vsh = np.zeros(len(depths))
-
-    if "PHIE" in cols:
-        phi = df[cols["PHIE"]].values
-    elif "DENB" in cols:
-        phi = np.clip((2.65 - df[cols["DENB"]].values) / 1.65, 0.0, 0.40)
-    else:
-        phi = np.full(len(depths), 0.10)
-
-    if "SWE" in cols:
-        sw = df[cols["SWE"]].values
-    elif "RDEEP" in cols:
-        rdeep = np.maximum(df[cols["RDEEP"]].values, 0.1)
-        sw = np.sqrt(np.clip(0.05 / (np.maximum(phi, 0.01)**2.0 * rdeep), 0.0, 1.0))
-    else:
-        sw = np.ones(len(depths))
+    # Shared Vsh/Phi/Sw derivation across entire well (linear GR Vsh)
+    vsh, phi, sw, _methods = derive_vsh_phi_sw(
+        df, cols, gr_method="linear", phi_clip=(0.0, 0.40), phi_default=0.10,
+        den_candidates=("DENB",))
 
     # Pay criteria: Vsh <= 0.3, Phi >= 0.1, Sw <= 0.5
-    is_pay = (vsh <= 0.3) & (phi >= 0.10) & (sw <= 0.50) & (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw))
+    is_pay = ((vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF) & (sw <= SW_CUTOFF)
+              & (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw)))
     
-    # Identify contiguous zones
+    # Identify contiguous zones (same diff idiom as _calc_crossover_polygons)
     zones = []
-    in_zone = False
-    start_idx = 0
-    
-    for i in range(len(is_pay)):
-        if is_pay[i] and not in_zone:
-            in_zone = True
-            start_idx = i
-        elif not is_pay[i] and in_zone:
-            in_zone = False
-            thickness = (i - start_idx) * med_step
-            if thickness >= min_thickness:
-                z_depths = depths[start_idx:i]
-                z_phi = phi[start_idx:i]
-                z_sw = sw[start_idx:i]
-                z_vsh = vsh[start_idx:i]
-                avg_p = float(np.mean(z_phi))
-                avg_s = float(np.mean(z_sw))
-                hcpv = thickness * avg_p * (1.0 - avg_s)
-                zones.append({
-                    "zone_name": f"Sweet Spot {len(zones) + 1}",
-                    "top_depth": round(float(z_depths[0]), 2),
-                    "base_depth": round(float(z_depths[-1]), 2),
-                    "thickness_m": round(thickness, 2),
-                    "avg_porosity": round(avg_p, 4),
-                    "avg_sw": round(avg_s, 4),
-                    "avg_vsh": round(float(np.mean(z_vsh)), 4),
-                    "hcpv_index": round(hcpv, 3)
-                })
+    for start_idx, end_idx in _contiguous_runs(is_pay):
+        thickness = (end_idx + 1 - start_idx) * med_step
+        if thickness >= min_thickness:
+            z_depths = depths[start_idx:end_idx + 1]
+            z_phi = phi[start_idx:end_idx + 1]
+            z_sw = sw[start_idx:end_idx + 1]
+            z_vsh = vsh[start_idx:end_idx + 1]
+            avg_p = float(np.mean(z_phi))
+            avg_s = float(np.mean(z_sw))
+            hcpv = thickness * avg_p * (1.0 - avg_s)
+            zones.append({
+                "zone_name": f"Sweet Spot {len(zones) + 1}",
+                "top_depth": round(float(z_depths[0]), 2),
+                "base_depth": round(float(z_depths[-1]), 2),
+                "thickness_m": round(thickness, 2),
+                "avg_porosity": round(avg_p, 4),
+                "avg_sw": round(avg_s, 4),
+                "avg_vsh": round(float(np.mean(z_vsh)), 4),
+                "hcpv_index": round(hcpv, 3)
+            })
 
     # Sort zones by hydrocarbon potential
     zones.sort(key=lambda x: x["hcpv_index"], reverse=True)
@@ -1165,23 +1223,10 @@ def compute_permeability_timur_coates(
     cols = {c.upper(): c for c in sub.columns}
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     
-    # Porosity
-    if "PHIE" in cols:
-        phi = sub[cols["PHIE"]].values
-    elif "DENB" in cols:
-        phi = np.clip((2.65 - sub[cols["DENB"]].values) / 1.65, 0.0, 0.45)
-    else:
-        phi = np.full(len(depths), 0.20)
-        
-    # Saturation
-    if "SWE" in cols:
-        sw = sub[cols["SWE"]].values
-    elif "RDEEP" in cols:
-        rdeep = np.maximum(sub[cols["RDEEP"]].values, 0.1)
-        sw = np.sqrt(np.clip(0.05 / (np.maximum(phi, 0.01)**2.0 * rdeep), 0.0, 1.0))
-    else:
-        sw = np.full(len(depths), 0.40)
-        
+    # Shared Phi/Sw derivation (Timur/Coates transforms below stay tool-specific)
+    _, phi, sw, _methods = derive_vsh_phi_sw(
+        sub, cols, phi_default=0.20, sw_default=0.40, den_candidates=("DENB",))
+
     phi_safe = np.clip(phi, 0.01, 0.45)
     swirr = np.clip(np.minimum(sw, 0.05 / phi_safe), 0.05, 0.95)
     
@@ -1204,23 +1249,20 @@ def compute_permeability_timur_coates(
     
     fig.update_yaxes(autorange="reversed", title_text="Depth (m)")
     fig.update_xaxes(type="log", title_text="Intrinsic Permeability (mD)", range=[-2, 4])
-    fig.update_layout(
+    fig.update_layout(_base_layout(
         title=f"<b>Permeability & Reservoir Flow Profile: {well_id}</b> ({model.capitalize()} Model)",
-        template="plotly_white",
-        height=620,
-        margin=dict(l=55, r=25, t=60, b=50),
-    )
+    ))
     
     return {
         "well_id": well_id,
         "model": model,
         "top_depth": top_depth,
         "bottom_depth": bottom_depth,
-        "figure_json": fig.to_json(),
+        "figure_json": _tag(fig, "1d").to_json(),
         "average_permeability_md": round(avg_k, 2),
         "max_permeability_md": round(max_k, 2),
         "flow_capacity_kh_md_m": round(kh_total, 2),
-        "reservoir_quality_class": "Excellent (>100 mD)" if avg_k > 100 else ("Good (10-100 mD)" if avg_k > 10 else "Fair/Tight (<10 mD)")
+        "reservoir_quality_class": _perm_quality_class(avg_k)
     }
 
 
@@ -1244,13 +1286,11 @@ def plot_crossplot_picket(
         
     depths = sub["DEPTH"].values
     
-    if "PHIE" in cols:
-        phi = sub[cols["PHIE"]].values
-    elif "DENB" in cols:
-        phi = np.clip((2.65 - sub[cols["DENB"]].values) / 1.65, 0.01, 0.45)
-    else:
-        phi = np.full(len(depths), 0.20)
-        
+    # Shared porosity derivation (Picket trendlines below stay tool-specific)
+    _, phi, _, _methods = derive_vsh_phi_sw(
+        sub, cols, phi_clip=(0.01, 0.45), phi_default=0.20,
+        den_candidates=("DENB",))
+
     r_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
     rt = sub[r_col].values if r_col else np.full(len(depths), 10.0)
     
@@ -1290,12 +1330,9 @@ def plot_crossplot_picket(
         
     fig.update_xaxes(type="log", title_text="True Formation Resistivity Rt (ohm.m)", range=[-1, 3])
     fig.update_yaxes(type="log", title_text="Effective Porosity Phi (v/v)", range=[-2, -0.3])
-    fig.update_layout(
+    fig.update_layout(_base_layout(
         title=f"<b>Archie Picket Plot: {well_id}</b> (Rw={rw} ohm.m, m={m}, n={n})",
-        template="plotly_white",
-        height=620,
-        margin=dict(l=55, r=25, t=60, b=50),
-    )
+    ))
     
     return {
         "well_id": well_id,
@@ -1303,7 +1340,7 @@ def plot_crossplot_picket(
         "m": m,
         "n": n,
         "samples_plotted": int(np.sum(valid)),
-        "figure_json": fig.to_json()
+        "figure_json": _tag(fig, "2d").to_json()
     }
 
 
@@ -1314,7 +1351,6 @@ def generate_reservoir_composite_report(
 ) -> Dict[str, Any]:
     """Generates an all-in-one zonal petrophysical dossier combining cutoffs, saturations, and flow capacity."""
     net_pay_data = compute_net_pay(well_id, top_depth, bottom_depth)
-    archie_data = calculate_archie_saturation(well_id, top_depth, bottom_depth)
     perm_data = compute_permeability_timur_coates(well_id, top_depth, bottom_depth)
     
     gross_h = net_pay_data["gross_interval_m"]
@@ -1325,7 +1361,7 @@ def generate_reservoir_composite_report(
     avg_vsh = net_pay_data["pay_zone_averages"]["average_shale_volume"]
     
     hcpv = round(net_pay_h * avg_phi * (1.0 - avg_sw), 3)
-    fluid_type = "Gas Sand (High Resistivity & Crossover)" if (avg_sw < 0.35 and avg_phi > 0.15) else ("Hydrocarbon Sand" if avg_sw < 0.50 else "Water Sand / Wet Formation")
+    fluid_type = _classify_fluid(avg_sw, avg_phi)
     
     return {
         "well_id": well_id,
@@ -1753,7 +1789,7 @@ def plot_3d_petrophysical_cube(
             fname: int(np.sum(facies_arr == fname))
             for fname, _ in facies_config
         },
-        "figure_json": fig.to_json()
+        "figure_json": _tag(fig, "3d").to_json()
     }
 
 
@@ -1803,30 +1839,18 @@ def plot_3d_wellbore_trajectory(
     dev_y = 60.0 * (1.0 - np.cos((depths - d0) / 180.0))
     z = tvd
 
-    if "VSHALE" in cols:
-        vsh = sub[cols["VSHALE"]].values
-    elif "GR" in cols:
-        vsh = np.clip((sub[cols["GR"]].values - 25.0) / 100.0, 0.0, 1.0)
-    else:
-        vsh = np.zeros(len(depths))
-
-    if "PHIE" in cols:
-        phi = sub[cols["PHIE"]].values
-    elif "DENB" in cols:
-        phi = np.clip((2.65 - sub[cols["DENB"]].values) / 1.65, 0.0, 0.40)
-    else:
-        phi = np.full(len(depths), 0.15)
+    # Shared Vsh/Phi/Sw derivation (linear GR Vsh; rdeep kept for coloring)
+    vsh, phi, sw, _methods = derive_vsh_phi_sw(
+        sub, cols, gr_method="linear", phi_clip=(0.0, 0.40), phi_default=0.15,
+        den_candidates=("DENB",), rdeep_candidates=("RDEEP", "ILD", "RT"),
+        rdeep_default=10.0)
 
     rdeep_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
     rdeep_vals = sub[rdeep_col].values if rdeep_col else np.full(len(depths), 10.0)
     rdeep_vals = np.maximum(rdeep_vals, 0.1)
 
-    if "SWE" in cols:
-        sw = sub[cols["SWE"]].values
-    else:
-        sw = np.sqrt(np.clip(0.05 / (np.maximum(phi, 0.01)**2.0 * rdeep_vals), 0.0, 1.0))
-
-    is_pay = (vsh <= 0.3) & (phi >= 0.10) & (sw <= 0.50) & (~np.isnan(depths))
+    is_pay = ((vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF) & (sw <= SW_CUTOFF)
+              & (~np.isnan(depths)))
 
     fig = go.Figure()
 
@@ -2000,10 +2024,10 @@ def plot_3d_wellbore_trajectory(
                 marker=dict(size=11, color="#f59e0b", opacity=1.0,
                             line=dict(color="#fef3c7", width=2)),
                 line=dict(color="#d97706", width=10),
-                text=[f"🎯 TARGET SWEET SPOT<br>{highlight_label or ''}<br>MD: {d:.1f}m"
+                text=[f"TARGET SWEET SPOT<br>{highlight_label or ''}<br>MD: {d:.1f}m"
                       for d in depths[hl_mask]],
                 hoverinfo="text",
-                name=f"🎯 Target: {highlight_label or 'Sweet Spot'}"
+                name=f"Target: {highlight_label or 'Sweet Spot'}"
             ))
 
             # Callout beacon pin: keep it tightly coupled to the wellbore so the
@@ -2041,7 +2065,7 @@ def plot_3d_wellbore_trajectory(
                 mode="text+markers",
                 marker=dict(size=14, color="#ef4444", symbol="circle",
                             line=dict(color="#fca5a5", width=3)),
-                text=[f"<b>🎯 TARGET SWEET SPOT</b><br>{highlight_label or ''}<br>{highlight_top:.0f}m – {highlight_base:.0f}m MD"],
+                text=[f"<b>TARGET SWEET SPOT</b><br>{highlight_label or ''}<br>{highlight_top:.0f}m – {highlight_base:.0f}m MD"],
                 textposition="bottom center",
                 textfont=dict(color="#7f1d1d", size=12, family="monospace"),
                 hoverinfo="text",
@@ -2059,9 +2083,9 @@ def plot_3d_wellbore_trajectory(
     fig_title = f"<b>3D Subsurface Wellbore Trajectory: {well_id}</b> (Color by: {active_attr.upper()})"
     if has_highlight:
         if highlight_matched:
-            fig_title += f" | 🎯 Zone {highlight_top:.0f}–{highlight_base:.0f}m"
+            fig_title += f" | Target Zone {highlight_top:.0f}–{highlight_base:.0f}m"
         else:
-            fig_title += " | ⚠️ Target outside data range"
+            fig_title += " | Target outside data range"
     fig.update_layout(
         title=fig_title,
         template="plotly_white",
@@ -2106,6 +2130,6 @@ def plot_3d_wellbore_trajectory(
         "view_top_m": float(view_top) if view_top is not None else None,
         "view_base_m": float(view_bot) if view_bot is not None else None,
         "highlight_matched": bool(highlight_matched) if has_highlight else None,
-        "figure_json": fig.to_json()
+        "figure_json": _tag(fig, "3d").to_json()
     }
 

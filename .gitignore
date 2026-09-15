@@ -107,3 +107,5 @@ scratch_*.py
 test_verify_*.py
 test_plot.html
 last_chat_response.json
+# Local-only study notes (never commit)
+LOCAL_*.md
