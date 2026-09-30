@@ -1,9 +1,12 @@
-"""Hybrid Agentic Query Orchestrator.
+"""Chat agent: Gemini chooses tools, the deterministic engine computes.
 
-Orchestrates deterministic petrophysical tools and local stratigraphy catalog
-using Gemini with executive Notion/Linear formatting.
+The model only picks tools and fills in their arguments; every number shown
+to the user comes from backend/petrophysics.py or backend/catalog.py.
 """
 
+import logging
+import re
+import time
 from typing import Any, Dict, List, Optional
 import httpx
 from backend.config import GEMINI_API_KEY, GEMINI_MODEL
@@ -23,6 +26,8 @@ from backend.petrophysics import (
     plot_3d_wellbore_trajectory,
 )
 from backend.catalog import query_catalog
+
+logger = logging.getLogger(__name__)
 
 TOOLS_DEFINITIONS = [
     {
@@ -221,35 +226,24 @@ TOOLS_DEFINITIONS = [
     }
 ]
 
-SYSTEM_PROMPT = """You are a Principal Subsurface Petrophysicist and Reservoir Evaluation Expert collaborating on a unified multi-well asset.
+SYSTEM_PROMPT = """You are a petrophysics assistant for a two-well log dataset. You answer by calling tools and reporting what they return.
 
-Asset Overview:
-You have TWO active wells loaded in memory:
-1. Well 1 (Target Alpha): Complete 25-curve LAS dataset from 0m to 2500m MD. Key target is the high-porosity shoreface gas sandstone between 1850m and 1950m MD (primary sweet spot: 1906.1m – 1914.6m).
-2. Well 2 (Exploration Beta): Deep exploration log dataset from 1176m to 3960m MD. Key target interval is between 3590m and 3850m MD.
+Data available:
+1. Well 1: LAS log, 0-2500 m MD, 25 curves (includes VSHALE, PHIE, SWE and TVDSS). A useful starting interval is 1850-1950 m.
+2. Well 2: LAS log, 1176-3960 m MD, 11 curves (no TVD, no pre-computed Vsh/porosity/Sw). A useful starting interval is 3590-3850 m.
 
-Operational & Output Directives:
-1. CLEAR WELL DISTINCTION (CRITICAL):
-   - Always make it unmistakably clear which well is being discussed.
-   - Use clear visual headers in your response:
-      - `### Well 1 (Target Alpha · 0–2500m)`
-      - `### Well 2 (Exploration Beta · 1176–3960m)`
-   - If the user asks a general question, does not name a specific well, or requests a comparison (e.g. "what are the sweet spots?", "what are the formation tops?", "compare reservoir quality", "what can you do?"), evaluate and present BOTH Well 1 and Well 2 with distinct sections.
-   - If the user specifies one well (e.g., "Analyze Well 2"), focus on that well while clearly labeling it.
-
-2. CONVERSATIONAL & PROFESSIONAL PEER TONE (NO ROBOTIC BOILERPLATE):
-   - NEVER output dry lists of tool names or raw function signatures (e.g. NEVER write "1. Log Visualization (plot_1d_well_log) - Generate 3-track...").
-   - Speak naturally and authoritatively as a senior subsurface colleague.
-   - When asked "what can you do?" or general greetings, provide a concise, natural briefing of both wells in the asset and suggest natural petrophysical workflows (e.g. cross-well sweet spot screening, multi-method shale volume benchmarking, Archie saturation & BVH modeling, 3D wellbore trajectory visualization).
-
-3. RIGOROUS GEOSCIENCE STANDARDS:
-   - Always run the relevant tools to calculate real, quantitative values before drawing conclusions.
-   - Structure evaluations into clean, professional sections:
-      - Executive Petrophysical Summary
-      - Quantitative Reservoir Volumetrics
-      - Multi-Log Crossover & Lithofacies Diagnostics (GR baseline, resistivity invasion, density-neutron gas crossover, acoustic response)
-      - Fluid Saturation & Contacts (Archie Sw, So, BVH, GWC / Free Water Level)
-      - Production & Completion Engineering Strategy (Perforations, CBL-VDL, DST, draw-down)
+Rules:
+1. GROUNDING (most important):
+   - Every number you state must come from a tool result in this conversation. Never estimate, recall or invent values.
+   - If a question needs something no tool computes (fluid contacts, pressures, completion or perforation advice, core data), say plainly that the data or tool does not provide it. Do not fill the gap.
+   - Mention the key assumptions a tool reports (cutoffs, "assumed" defaults, the methodology string, "illustrative" notes).
+   - The 3D wellbore path and top-pay surface are illustrative, not surveyed or mapped; never describe their positions or dip as measured.
+2. WELLS:
+   - Always say which well a result belongs to, using a `### Well 1` / `### Well 2` header when discussing both.
+   - If the question names no well and is not a comparison, use the active well given below.
+3. STYLE:
+   - Be concise and plain. Explain what a log or number means in simple terms when helpful (e.g. "low gamma ray usually means clean sand").
+   - Use short sections or a small table only when they help. No marketing language.
 """
 
 
@@ -394,259 +388,220 @@ def execute_tool(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optio
         return {"error": str(e)}, None
 
 
-def run_agent_turn(query: str, chat_history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-    """Runs an agent turn with multi-turn tool execution and rich senior-level synthesis."""
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+MAX_TOOL_TURNS = 3
+TURN_BUDGET_S = 60.0  # hard ceiling for one chat turn across all models
+
+SYNTHESIS_PROMPT = (
+    "Summarize the tool results above for the user's question. Use only numbers that appear "
+    "in those results, state the main assumptions they report, and say plainly if the "
+    "question needs something the tools did not compute."
+)
+
+
+def _post_gemini(model_name: str, payload: Dict[str, Any], timeout: float) -> Optional[Dict[str, Any]]:
+    """POST generateContent; returns the JSON body or None (logged) on failure."""
+    url = f"{GEMINI_BASE_URL}/{model_name}:generateContent"
+    try:
+        # Key in a header, not the query string, so it never lands in URLs/logs.
+        resp = httpx.post(url, json=payload, timeout=timeout,
+                          headers={"x-goog-api-key": GEMINI_API_KEY})
+    except httpx.HTTPError as e:
+        logger.warning("Gemini %s request failed: %s", model_name, e)
+        return None
+    if resp.status_code != 200:
+        logger.warning("Gemini %s returned HTTP %s: %s", model_name, resp.status_code, resp.text[:300])
+        return None
+    return resp.json()
+
+
+def _candidate_parts(resp_json: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    candidate = (resp_json.get("candidates") or [{}])[0]
+    content = candidate.get("content", {}) or {}
+    return content, content.get("parts", []) or []
+
+
+def run_agent_turn(
+    query: str,
+    chat_history: Optional[List[Dict[str, str]]] = None,
+    active_well: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Runs one chat turn: Gemini picks tools, the engine computes, Gemini summarizes."""
     if not GEMINI_API_KEY:
-        return _generate_executive_dossier(query, [], [])
-        
+        return _generate_offline_summary(query, [], [], active_well)
+
     models_to_try = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"]))
+    system_text = SYSTEM_PROMPT + f"\nActive well selected in the UI: {active_well or 'Well1'}\n"
 
     contents = []
     if chat_history:
         for msg in chat_history[-6:]:
             role = "user" if msg["role"] == "user" else "model"
             contents.append({"role": role, "parts": [{"text": msg["content"]}]})
-            
     contents.append({"role": "user", "parts": [{"text": query}]})
-    
+
     generated_figures: List[str] = []
     executed_tools_info: List[Dict[str, Any]] = []
+    deadline = time.monotonic() + TURN_BUDGET_S
+
+    def remaining(cap: float) -> float:
+        return min(cap, deadline - time.monotonic())
 
     for model_name in models_to_try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+        if remaining(25.0) <= 1.0:
+            logger.warning("Chat turn budget of %.0fs exhausted", TURN_BUDGET_S)
+            break
         current_contents = list(contents)
-        tool_turns = 0
-        max_tool_turns = 3
 
-        while tool_turns < max_tool_turns:
-            tool_turns += 1
-            payload = {
-                "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        for _ in range(MAX_TOOL_TURNS):
+            timeout = remaining(25.0)
+            if timeout <= 1.0:
+                break
+            resp_json = _post_gemini(model_name, {
+                "system_instruction": {"parts": [{"text": system_text}]},
                 "contents": current_contents,
                 "tools": [{"function_declarations": TOOLS_DEFINITIONS}],
                 "generation_config": {"temperature": 0.2}
-            }
-            
-            try:
-                resp = httpx.post(url, json=payload, timeout=25.0)
-                if resp.status_code != 200:
-                    break
-                    
-                resp_json = resp.json()
-                candidate = resp_json.get("candidates", [{}])[0]
-                content = candidate.get("content", {})
-                parts = content.get("parts", [])
-                
-                function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
-                
-                if function_calls:
-                    current_contents.append(content)
-                    tool_resps = []
-                    for fc in function_calls:
-                        fn_name = fc["name"]
-                        fn_args = fc.get("args", {})
-                        
-                        tool_result, fig_json = execute_tool(fn_name, fn_args)
-                        if fig_json:
-                            generated_figures.append(fig_json)
-                        executed_tools_info.append({"name": fn_name, "args": fn_args, "result": tool_result})
-                        
-                        tool_resps.append({"functionResponse": {"name": fn_name, "response": {"result": tool_result}}})
-                        
-                    current_contents.append({"role": "user", "parts": tool_resps})
-                else:
-                    text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    text_out = "".join(text_parts).strip()
-                    if text_out:
-                        return {
-                            "text": text_out,
-                            "figures": generated_figures,
-                            "tool_calls": executed_tools_info
-                        }
-                    break
-            except Exception:
+            }, timeout)
+            if resp_json is None:
                 break
 
-        # If tools were executed but the model hit turn limit without writing the text synthesis:
-        if executed_tools_info:
-            try:
-                synthesis_prompt = (
-                    "Synthesize all the above petrophysical tool calculations and geological findings into an exhaustive, "
-                    "deeply analytical, senior-level Petrophysical & Geoscientific Evaluation Dossier according to your instructions. "
-                    "Include the exact quantitative metrics, log curve interpretation, fluid contact diagnostics, and engineering/completion recommendations."
-                )
-                current_contents.append({"role": "user", "parts": [{"text": synthesis_prompt}]})
-                synthesis_payload = {
-                    "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-                    "contents": current_contents,
-                    "generation_config": {"temperature": 0.25}
-                }
-                resp = httpx.post(url, json=synthesis_payload, timeout=30.0)
-                if resp.status_code == 200:
-                    resp_json = resp.json()
-                    candidate = resp_json.get("candidates", [{}])[0]
-                    parts = candidate.get("content", {}).get("parts", [])
-                    text_parts = [p.get("text", "") for p in parts if "text" in p]
-                    text_out = "".join(text_parts).strip()
-                    if len(text_out) > 80:
-                        return {
-                            "text": text_out,
-                            "figures": generated_figures,
-                            "tool_calls": executed_tools_info
-                        }
-            except Exception:
-                pass
+            content, parts = _candidate_parts(resp_json)
+            function_calls = [p["functionCall"] for p in parts if "functionCall" in p]
 
-    # If all models fail or quota is exhausted, run deterministic executive synthesis
-    return _generate_executive_dossier(query, generated_figures, executed_tools_info)
+            if function_calls:
+                current_contents.append(content)
+                tool_resps = []
+                for fc in function_calls:
+                    fn_name = fc["name"]
+                    fn_args = fc.get("args", {})
+                    tool_result, fig_json = execute_tool(fn_name, fn_args)
+                    if fig_json:
+                        generated_figures.append(fig_json)
+                    executed_tools_info.append({"name": fn_name, "args": fn_args, "result": tool_result})
+                    tool_resps.append({"functionResponse": {"name": fn_name, "response": {"result": tool_result}}})
+                current_contents.append({"role": "user", "parts": tool_resps})
+                continue
+
+            text_out = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+            if text_out:
+                return {"text": text_out, "figures": generated_figures, "tool_calls": executed_tools_info}
+            break
+
+        # Tools ran but the model hit the turn limit without writing an answer.
+        if executed_tools_info and remaining(30.0) > 1.0:
+            current_contents.append({"role": "user", "parts": [{"text": SYNTHESIS_PROMPT}]})
+            resp_json = _post_gemini(model_name, {
+                "system_instruction": {"parts": [{"text": system_text}]},
+                "contents": current_contents,
+                "generation_config": {"temperature": 0.2}
+            }, remaining(30.0))
+            if resp_json is not None:
+                _, parts = _candidate_parts(resp_json)
+                text_out = "".join(p.get("text", "") for p in parts if "text" in p).strip()
+                if text_out:
+                    return {"text": text_out, "figures": generated_figures, "tool_calls": executed_tools_info}
+
+    # Every model failed (quota, network, timeout): fall back to a fixed-format
+    # report built only from deterministic tool results.
+    return _generate_offline_summary(query, generated_figures, executed_tools_info, active_well)
 
 
-def _generate_executive_dossier(
+_GREETING_RE = re.compile(r"\b(hi|hello|hey|help|who are you|what can you do|capabilities|overview)\b")
+_WELL1_RE = re.compile(r"\bwell\s*1\b|\bwell1\b")
+_WELL2_RE = re.compile(r"\bwell\s*2\b|\bwell2\b")
+TARGET_INTERVALS = {"Well1": (1850.0, 1950.0), "Well2": (3590.0, 3850.0)}
+
+
+def _fmt(value: Any, spec: str, scale: float = 1.0) -> str:
+    return format(value * scale, spec) if isinstance(value, (int, float)) else "n/a"
+
+
+def _generate_offline_summary(
     query: str,
     figures: List[str],
-    executed_tools: List[Dict[str, Any]]
+    executed_tools: List[Dict[str, Any]],
+    active_well: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Generates an exhaustive, high-depth petrophysical dossier dynamically from deterministic tools."""
+    """Fixed-format report used when the LLM is unavailable.
+
+    Every number printed here comes from a tool run in this function (recorded
+    in tool_calls for the UI audit badges); nothing is hard-coded or guessed.
+    """
     q = query.lower()
 
-    # If general greeting / capabilities question
-    if any(k in q for k in ["what can you do", "help", "who are you", "hello", "hi", "capabilities", "overview"]):
-        briefing = """### Unified Asset Workspace Overview
-We have two active wells loaded in our evaluation environment:
+    def run(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str]]:
+        result, fig = execute_tool(name, args)
+        executed_tools.append({"name": name, "args": args, "result": result})
+        return result, fig
 
-* **Well 1 (Target Alpha · 0–2500m MD)**: Complete 25-curve LAS suite targeting a prolific shoreface gas sandstone reservoir between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
-* **Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration dataset targeting stacked reservoir sands between **3590m and 3850m**.
+    note = ("_Offline summary: the language model is unavailable, so this is a fixed-format report "
+            "built only from tool results. Ask again later for a written interpretation._")
 
-#### Recommended Collaborative Workflows:
-1. **Cross-Well Sweet Spot Comparison**: Compare commercial net pay, porosity, and hydrocarbon pore volume (HCPV) across both wells.
-2. **Deterministic Shaly-Sand Volumetrics**: Compute continuous Archie water saturation ($S_w$), Bulk Volume Hydrocarbon (BVH), and benchmark 4 shale volume algorithms.
-3. **Multi-Track Log & Crossplot Diagnostics**: Generate 1D triple-combo log plots and 2D lithology crossplots with mineral trendlines.
-4. **3D Subsurface Visualization**: Interactively inspect 3D wellbore trajectories with reservoir top horizon surfaces and 3D petrophysical cluster cubes.
-"""
-        return {
-            "text": briefing.strip(),
-            "figures": figures,
-            "tool_calls": executed_tools
-        }
+    # Short greetings / "what can you do" -> list the data actually loaded.
+    if _GREETING_RE.search(q) and len(q.split()) <= 6:
+        lines = [note, "", "### Loaded wells"]
+        for well in ("Well1", "Well2"):
+            info, _ = run("get_well_curves_summary", {"well_id": well})
+            if "error" in info:
+                lines.append(f"* **{well}**: could not be read ({info['error']})")
+            else:
+                lines.append(f"* **{well}**: {info['start_depth']}–{info['stop_depth']} m MD, "
+                             f"{info['total_curves']} curves")
+        lines += ["", "Try: *\"Show the 1D log for Well 1 from 1850 to 1950 m\"* or "
+                      "*\"Compute net pay for Well 2 between 3650 and 3750 m\"*."]
+        return {"text": "\n".join(lines), "figures": figures, "tool_calls": executed_tools}
 
-    # Determine if query targets Well 1, Well 2, or both
-    targets_well1 = "well 1" in q or "well1" in q or "alpha" in q
-    targets_well2 = "well 2" in q or "well2" in q or "beta" in q
-    is_multi_well = (targets_well1 and targets_well2) or (not targets_well1 and not targets_well2) or ("compare" in q) or ("both" in q) or ("sweet" in q)
+    names1, names2 = bool(_WELL1_RE.search(q)), bool(_WELL2_RE.search(q))
+    if (names1 and names2) or "compare" in q or "both" in q:
+        wells = ["Well1", "Well2"]
+    elif names1 or names2:
+        wells = ["Well1"] if names1 else ["Well2"]
+    else:
+        wells = [active_well if active_well in TARGET_INTERVALS else "Well1"]
 
-    if is_multi_well:
-        # Run sweet spot scan for both wells
-        w1_sweet, _ = execute_tool("scan_reservoir_sweetspots", {"well_id": "Well1", "min_thickness": 1.5})
-        w2_sweet, _ = execute_tool("scan_reservoir_sweetspots", {"well_id": "Well2", "min_thickness": 1.5})
-        w1_comp, _ = execute_tool("generate_reservoir_composite_report", {"well_id": "Well1", "top_depth": 1906.0, "bottom_depth": 1915.0})
-        w2_comp, _ = execute_tool("generate_reservoir_composite_report", {"well_id": "Well2", "top_depth": 3668.0, "bottom_depth": 3684.0})
+    sections = [note]
+    for well in wells:
+        sections.append(f"\n### {well}")
+        scan, _ = run("scan_reservoir_sweetspots", {"well_id": well, "min_thickness": 1.5})
+        if "error" in scan:
+            sections.append(f"Sweet-spot scan failed: {scan['error']}")
+            continue
+        zones = scan.get("sweetspots", [])
+        n_zones = scan.get('total_sweetspots_found', 0)
+        sections.append(f"Sweet-spot scan (Vsh ≤ 0.30, φ ≥ 0.10, Sw ≤ 0.50, zones ≥ 1.5 m): "
+                        f"**{n_zones}** zone{'' if n_zones == 1 else 's'}, "
+                        f"**{_fmt(scan.get('total_pay_thickness_m'), '.2f')} m** of pay in total.")
+
+        if zones:
+            best = zones[0]
+            top, base = best["top_depth"], best["base_depth"]
+            comp, _ = run("generate_reservoir_composite_report",
+                          {"well_id": well, "top_depth": top, "bottom_depth": base})
+            if "error" in comp:
+                sections.append(f"Composite report failed: {comp['error']}")
+            else:
+                sections += [
+                    f"\nHighest-ranked zone: **{top}–{base} m** ({best['thickness_m']} m).",
+                    "",
+                    "| Metric | Value |",
+                    "| --- | --- |",
+                    f"| Net pay | {_fmt(comp.get('net_pay_m'), '.2f')} m |",
+                    f"| Net-to-gross | {_fmt(comp.get('net_to_gross'), '.2f')} |",
+                    f"| Average porosity | {_fmt(comp.get('average_porosity'), '.1f', 100)} % |",
+                    f"| Average water saturation | {_fmt(comp.get('average_water_saturation'), '.1f', 100)} % |",
+                    f"| Average shale volume | {_fmt(comp.get('average_shale_volume'), '.1f', 100)} % |",
+                    f"| Flow capacity kh (Timur, pay only) | {_fmt(comp.get('flow_capacity_kh_md_m'), '.1f')} mD·m |",
+                    f"| Rough fluid label (from Sw and porosity only) | {comp.get('interpreted_fluid_regime', 'n/a')} |",
+                ]
+            plot_top, plot_bot = top - 20.0, base + 20.0
+        else:
+            sections.append("No zone passed all cutoffs.")
+            plot_top, plot_bot = TARGET_INTERVALS.get(well, (None, None))
 
         if not figures:
-            _, fig1 = execute_tool("plot_1d_well_log", {"well_id": "Well1", "top_depth": 1880.0, "bottom_depth": 1940.0})
-            if fig1:
-                figures.append(fig1)
+            _, fig = run("plot_1d_well_log", {"well_id": well, "top_depth": plot_top, "bottom_depth": plot_bot})
+            if fig:
+                figures.append(fig)
 
-        multi_text = rf"""### Well 1 (Target Alpha · 0–2500m)
-* **Primary Target Interval**: 1850.0m – 1950.0m MD (Shoreface Gas Sandstone)
-* **Delineated Sweet Spot**: 1906.1m – 1914.6m MD (**{w1_sweet.get('sweetspots', [{}])[0].get('thickness_m', 8.69):.2f}m** continuous net pay)
-* **Quantitative Reservoir Metrics**:
-  * Average Effective Porosity ($\Phi_e$): **{w1_comp.get('average_porosity', 0.22) * 100:.1f}%**
-  * Average Water Saturation ($S_w$): **{w1_comp.get('average_water_saturation', 0.28) * 100:.1f}%**
-  * Average Shale Volume ($V_{{sh}}$): **{w1_comp.get('average_shale_volume', 0.03) * 100:.1f}%** (Ultra-clean quartzose reservoir)
-  * Flow Capacity ($k \cdot h$): **{w1_comp.get('flow_capacity_kh_md_m', 635.8):.1f} mD·m**
-  * Hydrocarbon Pore Volume (HCPV): **{w1_comp.get('hydrocarbon_pore_volume_hcpv_m', 1.38):.2f} m**
-
----
-
-### Well 2 (Exploration Beta · 1176–3960m)
-* **Primary Target Interval**: 3590.0m – 3850.0m MD (Deep Exploration Sands)
-* **Delineated Sweet Spots**: **{w2_sweet.get('total_sweetspots_found', 28)} distinct pay zones** totaling **{w2_sweet.get('total_pay_thickness_m', 129.5):.2f}m** of net pay.
-* **Top-Tier Sweet Spot**: 3668.7m – 3683.5m MD (**14.94m** continuous net pay)
-* **Quantitative Reservoir Metrics**:
-  * Average Effective Porosity ($\Phi_e$): **{w2_comp.get('average_porosity', 0.19) * 100:.1f}%**
-  * Average Water Saturation ($S_w$): **{w2_comp.get('average_water_saturation', 0.05) * 100:.1f}%** (Strong gas/condensate column)
-  * Average Shale Volume ($V_{{sh}}$): **{w2_comp.get('average_shale_volume', 0.12) * 100:.1f}%**
-  * Flow Capacity ($k \cdot h$): **{w2_comp.get('flow_capacity_kh_md_m', 820.4):.1f} mD·m**
-  * Hydrocarbon Pore Volume (HCPV): **{w2_comp.get('hydrocarbon_pore_volume_hcpv_m', 2.75):.2f} m**
-
----
-
-### Comparative Petrophysical Summary
-* **Storage & Deliverability**: Well 1 displays superior matrix cleanliness ($V_{{sh}} \approx 2.6\%$) and higher intrinsic porosity ($22\%$), making it an ideal high-rate production candidate. Well 2 provides substantial cumulative hydrocarbon column across stacked intervals with extremely high hydrocarbon saturation ($S_{{hc}} > 94\%$).
-* **Fluid Regimes**: Both wells present pronounced gas butterfly crossovers on Density-Neutron logs and high deep resistivity ($R_t > 40\ \Omega\cdot\text{{m}}$).
-"""
-        return {
-            "text": multi_text.strip(),
-            "figures": figures,
-            "tool_calls": executed_tools
-        }
-
-    # Single Well Evaluation
-    well_id = "Well2" if targets_well2 else "Well1"
-    top = 1850.0 if well_id == "Well1" else 3590.0
-    bot = 1950.0 if well_id == "Well1" else 3850.0
-    well_label = "Well 1 (Target Alpha · 0–2500m)" if well_id == "Well1" else "Well 2 (Exploration Beta · 1176–3960m)"
-
-    sweet_data, _ = execute_tool("scan_reservoir_sweetspots", {"well_id": well_id, "min_thickness": 1.5})
-    best_zone = sweet_data.get("sweetspots", [{}])[0] if sweet_data.get("sweetspots") else {}
-    target_top = best_zone.get("top_depth", top)
-    target_bot = best_zone.get("base_depth", bot)
-
-    comp_data, _ = execute_tool("generate_reservoir_composite_report", {"well_id": well_id, "top_depth": target_top, "bottom_depth": target_bot})
-
-    if not figures:
-        _, fig1 = execute_tool("plot_1d_well_log", {"well_id": well_id, "top_depth": target_top - 20, "bottom_depth": target_bot + 20})
-        if fig1:
-            figures.append(fig1)
-
-    net_pay_m = comp_data.get("net_pay_m", best_zone.get("thickness_m", 8.69))
-    ntg = comp_data.get("net_to_gross", 0.85)
-    phi_pct = round(comp_data.get("average_porosity", 0.22) * 100, 1)
-    sw_pct = round(comp_data.get("average_water_saturation", 0.28) * 100, 1)
-    vsh_pct = round(comp_data.get("average_shale_volume", 0.08) * 100, 1)
-    hcpv = comp_data.get("hydrocarbon_pore_volume_hcpv_m", 1.38)
-    kh = comp_data.get("flow_capacity_kh_md_m", 635.8)
-    avg_k = comp_data.get("average_permeability_md", 73.2)
-    fluid = comp_data.get("interpreted_fluid_regime", "Gas Sand (High Resistivity & Crossover)")
-
-    dossier_text = rf"""### {well_label}
-
-#### Executive Petrophysical Summary
-Multi-track log evaluation and automated reservoir zonation for **{well_id}** delineate a premier **{fluid}** across **{target_top:.2f}m – {target_bot:.2f}m**. The primary pay interval provides **{net_pay_m:.2f} m** of continuous net pay with an extraordinary Net-to-Gross (**NTG**) of **{ntg:.2f}** and an accumulated Hydrocarbon Pore Volume (**HCPV**) of **{hcpv:.2f} m**.
-
-#### Quantitative Reservoir Volumetrics
-| Petrophysical Parameter | Measured / Evaluated Value | Oilfield Benchmark | Status |
-| :--- | :--- | :--- | :--- |
-| **Evaluated Target Interval** | `{target_top:.2f} m – {target_bot:.2f} m` | Reservoir Section | Identified |
-| **Gross Pay Thickness (h)** | `{comp_data.get('gross_thickness_m', net_pay_m):.2f} m` | Structural Envelope | Target Unit |
-| **Net Hydrocarbon Pay** | `**{net_pay_m:.2f} m**` | > 3.0 m Commercial Cutoff | **Commercial Pay** |
-| **Net-to-Gross (NTG)** | `**{ntg:.3f}**` | > 0.60 Regional Threshold | **Exceptional** |
-| **Average Effective Porosity ($\Phi_e$)** | `**{phi_pct}%**` | 18% – 25% Prolific Sand | **High Storage Capacity** |
-| **Average Water Saturation ($S_w$)** | `**{sw_pct}%**` | < 45% Pay Standard | **Low Water / Irreducible** |
-| **Hydrocarbon Saturation ($S_o / S_g$)** | `**{100 - sw_pct:.1f}%**` | > 55% Target Hydrocarbon | **High HC Column** |
-| **Average Shale Volume ($V_{{sh}}$)** | `**{vsh_pct}%**` | < 15% Clean Sand | **Clean Quartz Matrix** |
-| **Flow Capacity ($k \cdot h$)** | `**{kh:.1f} mD·m**` | > 100 mD·m High Flow | **Unrestricted Inflow** |
-| **Mean Intrinsic Permeability ($k$)** | `**{avg_k:.1f} mD**` | Timur Empirical Model | **Excellent Flow** |
-
-#### Multi-Log Crossover & Lithofacies Diagnostics
-- **Gamma Ray Deflection**: GR drops to an ultra-clean baseline (~26–34 API), verifying an absence of detrital clays and illite/smectite laminations.
-- **Deep vs. Shallow Resistivity Profile**: Deep resistivity ($R_{{deep}}$) spikes dramatically to **42–85 $\Omega\cdot$m**, displaying a distinctive positive invasion profile over shallow resistivity ($R_{{shal}}$), confirming mud-filtrate invasion into a highly permeable, hydrocarbon-bearing reservoir.
-- **Density-Neutron Gas Crossover**: Pronounced separation between Bulk Density ($\rho_b \approx 2.12\text{{ g/cm}}^3$) and Neutron Porosity ($\Phi_N \approx 0.11\text{{ v/v}}$) exhibits a classic **Gas Butterfly Crossover**, caused by hydrogen index reduction in the flushed zone.
-- **Sonic Acoustic Response**: Compressional travel time ($DT_{{comp}}$) averages ~82–88 $\mu\text{{s/ft}}$, aligning with high acoustic porosity in weakly consolidated, high-permeability sandstone.
-
-#### Fluid Saturation & Contacts
-Using calibrated Archie parameters ($a=1.0$, $m=2.0$, $n=2.0$, $R_w=0.05\ \Omega\cdot\text{{m}}$), computed water saturation drops to a minimum of **{sw_pct * 0.7:.1f}%**, signifying near-irreducible capillary water saturation ($S_{{wirr}}$). 
-- **Bulk Volume Hydrocarbon (BVH)** peaks at **0.18–0.21 v/v**, indicating continuous hydrocarbon occupancy across primary pore throats.
-- **Free Water Level / Contact**: No transition zone is detected down to {target_bot:.1f}m; the lower bounding shale creates an effective capillary bottom seal.
-
-#### Production & Completion Engineering Strategy
-1. **Perforation Window**: Prioritize through-tubing perforations across **{target_top + 1.0:.1f}m – {target_bot - 0.5:.1f}m** using 6 SPF casing guns with $60^\circ$ phasing to minimize skin damage.
-2. **Drill-Stem Testing (DST)**: Set packer seat at **{target_top - 5.0:.1f}m** inside the competent capping shale to test flow rates and determine initial reservoir pressure ($P_i$).
-3. **Sand Control**: Given the high permeability ({avg_k:.1f} mD) and density-neutron separation, gravel packing or premium mesh screens are advised to mitigate sand migration during sustained high-rate gas flow.
-"""
-    return {
-        "text": dossier_text.strip(),
-        "figures": figures,
-        "tool_calls": executed_tools
-    }
-
+    return {"text": "\n".join(sections).strip(), "figures": figures, "tool_calls": executed_tools}

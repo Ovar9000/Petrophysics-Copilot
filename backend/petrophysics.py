@@ -4,6 +4,7 @@ Handles tabular depth-series calculation and multi-track / crossplot generation
 using lasio, pandas, numpy, and plotly.
 """
 
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import lasio
@@ -18,6 +19,12 @@ from backend.config import DATA_DIR
 
 def _find_las_path(well_id: str) -> Path:
     clean_id = well_id.strip()
+    # A well id is a bare name (e.g. "Well1"), never a path: it arrives from
+    # HTTP bodies and LLM tool arguments, so refuse anything that could point
+    # outside DATA_DIR.
+    if not clean_id or any(ch in clean_id for ch in "/\\:") or ".." in clean_id:
+        raise FileNotFoundError(f"Invalid well id '{well_id}'")
+    data_root = DATA_DIR.resolve()
     candidates = [
         DATA_DIR / clean_id,
         DATA_DIR / f"{clean_id}.las",
@@ -26,7 +33,7 @@ def _find_las_path(well_id: str) -> Path:
         DATA_DIR / f"{clean_id.upper()}.las",
     ]
     for p in candidates:
-        if p.exists() and p.is_file():
+        if p.exists() and p.is_file() and p.resolve().is_relative_to(data_root):
             return p
     for p in DATA_DIR.glob("*.las"):
         if p.stem.lower() == clean_id.lower():
@@ -34,11 +41,12 @@ def _find_las_path(well_id: str) -> Path:
     raise FileNotFoundError(f"LAS file for well '{well_id}' not found in {DATA_DIR}")
 
 
-def read_las(well_id: str) -> tuple[lasio.LASFile, pd.DataFrame]:
-    las_path = _find_las_path(well_id)
-    las = lasio.read(str(las_path))
+@lru_cache(maxsize=8)
+def _load_las_cached(path_str: str, mtime: float) -> tuple[lasio.LASFile, pd.DataFrame]:
+    """Parse a LAS file once per (path, modification time)."""
+    las = lasio.read(path_str)
     df = las.df().reset_index()
-    
+
     # Ensure DEPTH is a clean column
     depth_cols = [c for c in df.columns if str(c).upper() == "DEPTH"]
     if depth_cols:
@@ -46,10 +54,17 @@ def read_las(well_id: str) -> tuple[lasio.LASFile, pd.DataFrame]:
             df["DEPTH"] = df[depth_cols[0]]
     else:
         df["DEPTH"] = np.linspace(float(las.well.STRT.value), float(las.well.STOP.value), len(df))
-    
+
     null_val = las.well.NULL.value if "NULL" in las.well else -999.25
     df = df.replace([null_val, -999.0, -999.25, -9999.0], np.nan)
     return las, df
+
+
+def read_las(well_id: str) -> tuple[lasio.LASFile, pd.DataFrame]:
+    las_path = _find_las_path(well_id)
+    las, df = _load_las_cached(str(las_path), las_path.stat().st_mtime)
+    # Callers slice and add columns, so hand out a copy of the cached frame.
+    return las, df.copy()
 
 
 def get_well_curves_summary(well_id: str) -> Dict[str, Any]:
@@ -167,6 +182,17 @@ ARCHIE_RW_EFF = 0.05     # effective a*Rw product for the Archie-type Sw estimat
 VSH_CUTOFF = 0.3
 PHI_CUTOFF = 0.10
 SW_CUTOFF = 0.50
+# The ONE Vsh/Phi/Sw recipe used wherever pay is flagged (net pay, sweet-spot
+# scanner, permeability kh, 3D trajectory) so those tools agree on the same
+# depths. Missing resistivity => Sw = 1 (no pay) rather than an assumed Rt.
+PAY_MODEL: Dict[str, Any] = dict(
+    gr_method="larionov",
+    phi_clip=(0.0, 0.45),
+    phi_default=0.15,
+    sw_default=1.0,
+    den_candidates=("DENB", "RHOB"),
+    rdeep_candidates=("RDEEP", "ILD", "RT"),
+)
 DEFAULT_MARKER_DEPTH = {"well1": 1908.0, "well2": 3650.0}
 # Mineral matrix trendline colors (single cluster where a palette pays off;
 # other charts reuse blues/reds with different local meanings, so they stay local)
@@ -178,6 +204,15 @@ def _gr_doorposts(gr: np.ndarray) -> Tuple[float, float]:
     if np.sum(~np.isnan(gr)) > 10:
         return float(np.nanpercentile(gr, 5)), float(np.nanpercentile(gr, 95))
     return 20.0, 120.0
+
+
+def _well_gr_bounds(df: pd.DataFrame) -> Optional[Tuple[float, float]]:
+    """GR clean/shale doorposts from the WHOLE well, so Vsh at a given depth
+    does not change with the depth window the user happens to select."""
+    cols = {str(c).upper(): c for c in df.columns}
+    if "GR" not in cols:
+        return None
+    return _gr_doorposts(df[cols["GR"]].values)
 
 
 def _larionov_vsh(gr: np.ndarray, gr_clean: float, gr_shale: float) -> np.ndarray:
@@ -215,19 +250,24 @@ def _perm_quality_class(avg_k: float) -> str:
     return "Fair/Tight (<10 mD)"
 
 
-def _tag(fig: go.Figure, plot_kind: str) -> go.Figure:
-    """Stamp the figure kind into layout.meta for the frontend tab router."""
-    fig.update_layout(meta={"plot_kind": plot_kind})
+def _tag(fig: go.Figure, plot_kind: str, well_id: str) -> go.Figure:
+    """Stamp figure kind + owning well into layout.meta for the frontend router.
+
+    The router keys its per-well cache off meta.well_id, so agent figures for
+    well B can never overwrite the cached view of well A.
+    """
+    fig.update_layout(meta={"plot_kind": plot_kind, "well_id": well_id})
     return fig
 
 
 def _classify_fluid(avg_sw: float, avg_phi: float) -> str:
-    """Fluid regime from pay-zone averages (gas needs low Sw *and* good rock)."""
+    """Rough fluid label from pay-zone averages only (Sw and porosity); it does
+    not look at density-neutron crossover, so it cannot tell gas from oil."""
     if avg_sw < 0.35 and avg_phi > 0.15:
-        return "Gas Sand (High Resistivity & Crossover)"
+        return "Hydrocarbon-bearing (low Sw, good porosity)"
     if avg_sw < 0.50:
-        return "Hydrocarbon Sand"
-    return "Water Sand / Wet Formation"
+        return "Possibly hydrocarbon-bearing (moderate Sw)"
+    return "Likely water-bearing (high Sw)"
 
 
 def _dejitter_quantized(x: np.ndarray, thresh: float = 0.8, sigma: float = 0.22,
@@ -279,12 +319,13 @@ def derive_vsh_phi_sw(
     rdeep_default: Optional[float] = None,
     use_vshale_log: bool = True,
     use_swe_log: bool = True,
+    gr_bounds: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, str]]:
     """Derive Vsh/Phi/Sw for a depth frame.
 
     Returns (vsh, phi, sw, methods); methods names the branch that fired per
-    property so callers can build audit footnotes. Math matches the historical
-    per-tool expressions exactly.
+    property so callers can build audit footnotes. Pass gr_bounds (from
+    _well_gr_bounds on the full well) so Larionov Vsh is window-independent.
     """
     n = len(frame)
     methods: Dict[str, str] = {}
@@ -295,10 +336,11 @@ def derive_vsh_phi_sw(
     elif "GR" in cols and gr_method != "none":
         gr = frame[cols["GR"]].values
         if gr_method == "larionov":
-            gr_clean, gr_shale = _gr_doorposts(gr)
+            gr_clean, gr_shale = gr_bounds if gr_bounds is not None else _gr_doorposts(gr)
             vsh = _larionov_vsh(gr, gr_clean, gr_shale)
+            scope = "whole well" if gr_bounds is not None else "interval"
             methods["vsh"] = (f"Vsh from GR via Larionov-T "
-                              f"(GRclean P5={gr_clean:.0f} / GRshale P95={gr_shale:.0f} API)")
+                              f"(GRclean P5={gr_clean:.0f} / GRshale P95={gr_shale:.0f} API, {scope})")
         else:
             vsh = _linear_vsh(gr)
             methods["vsh"] = "Vsh from GR linear baseline (25/125 API)"
@@ -392,8 +434,10 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
             bit_vals = df[bit_col].values
             bit_name = "Bit Size (in)"
         else:
+            # No bit-size curve in the file: this is a guessed reference, so
+            # washout/mudcake shading against it is approximate.
             bit_vals = np.full_like(depth, default_bs)
-            bit_name = f"Bit Size Ref ({default_bs}\")"
+            bit_name = f"Bit Size ({default_bs}\", assumed)"
 
         if has_cali:
             # Washout shading (CALI > BIT): subtle slate gray wash
@@ -654,7 +698,7 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
         "well_id": well_id,
         "top_depth": min_d,
         "bottom_depth": max_d,
-        "figure_json": _tag(fig, "1d").to_json(),
+        "figure_json": _tag(fig, "1d", well_id).to_json(),
         "summary": f"Generated 3-track composite log for {well_title} across {min_d:.1f}m - {max_d:.1f}m."
     }
 
@@ -776,14 +820,17 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
             label_x = float(np.nanpercentile(x_vals, 96))
             # On the reversed y-axis, smaller y renders higher on screen ("up")
             label_y = float(min(mean_gas_y - 0.20, np.nanpercentile(y_vals, 6)))
+            # NOTE Plotly semantics: text renders at (ax, ay), arrowhead lands at
+            # (x, y). So the cluster centroid goes in x/y (head into the data)
+            # and the whitespace corner goes in ax/ay (text out of the way).
             annotations.append(
                 dict(
-                    x=label_x,
-                    y=label_y,
+                    x=mean_gas_x,
+                    y=mean_gas_y,
                     xref="x",
                     yref="y",
-                    ax=mean_gas_x,
-                    ay=mean_gas_y,
+                    ax=label_x,
+                    ay=label_y,
                     axref="x",
                     ayref="y",
                     text="<b>Gas Correction Vector</b><br><i>(Hydrocarbon crossover shift)</i>",
@@ -861,7 +908,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
     
     return {
         "well_id": well_id,
-        "figure_json": _tag(fig, "2d").to_json(),
+        "figure_json": _tag(fig, "2d", well_id).to_json(),
         "data_points": len(sub_df),
         "summary": f"Generated 2D crossplot with {len(sub_df)} points for {well_title}."
     }
@@ -886,15 +933,18 @@ def compute_net_pay(
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     cols = {c.upper(): c for c in sub_df.columns}
     
-    # Shared Vsh/Phi/Sw derivation (Larionov Vsh, density porosity, Archie-type Sw)
-    vsh, phi, sw, methods = derive_vsh_phi_sw(sub_df, cols)
+    # Shared Vsh/Phi/Sw derivation (same recipe as the sweet-spot scanner)
+    vsh, phi, sw, methods = derive_vsh_phi_sw(
+        sub_df, cols, gr_bounds=_well_gr_bounds(df), **PAY_MODEL)
     vsh_method, phi_method, sw_method = methods["vsh"], methods["phi"], methods["sw"]
 
     valid = (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw))
     is_res = (vsh <= vsh_cutoff) & (phi >= phi_cutoff) & valid
     is_pay = is_res & (sw <= sw_cutoff) & valid
-    
-    gross = float(depths[-1] - depths[0]) if len(depths) > 1 else med_step
+
+    # Each sample represents one step of thickness, for gross AND net, so
+    # net can never exceed gross (last-minus-first depth is one step short).
+    gross = float(len(depths) * med_step)
     net_res = float(np.sum(is_res) * med_step)
     net_pay = float(np.sum(is_pay) * med_step)
     wet_res_m = float(np.sum(is_res & (~is_pay)) * med_step)
@@ -992,8 +1042,9 @@ def compare_vshale_methods(well_id: str, top_depth: float, bottom_depth: float) 
         
     depths = sub["DEPTH"].values
     gr = sub["GR"].values
-    gr_min = float(np.percentile(gr, 2))
-    gr_max = float(np.percentile(gr, 98))
+    # Same whole-well P5/P95 doorposts as net pay and the scanner, so the
+    # Larionov curve here matches the Vsh those tools use.
+    gr_min, gr_max = _well_gr_bounds(df) or _gr_doorposts(gr)
     if gr_max == gr_min:
         gr_max += 1.0
         
@@ -1032,7 +1083,7 @@ def compare_vshale_methods(well_id: str, top_depth: float, bottom_depth: float) 
         "well_id": well_id,
         "top_depth": top_depth,
         "bottom_depth": bottom_depth,
-        "figure_json": _tag(fig, "1d").to_json(),
+        "figure_json": _tag(fig, "1d", well_id).to_json(),
         "averages": {
             "linear_avg": round(float(np.mean(igr)), 4),
             "larionov_avg": round(float(np.mean(vsh_larionov)), 4),
@@ -1095,11 +1146,12 @@ def calculate_archie_saturation(
     
     return {
         "well_id": well_id,
-        "figure_json": _tag(fig, "1d").to_json(),
+        "figure_json": _tag(fig, "1d", well_id).to_json(),
         "average_sw": round(float(np.nanmean(sw)), 4),
         "average_shc": round(float(np.nanmean(shc)), 4),
         "average_bvh": round(float(np.nanmean(bvh)), 4),
-        "max_bvh": round(float(np.nanmax(bvh)), 4)
+        "max_bvh": round(float(np.nanmax(bvh)), 4),
+        "basis": "Interval averages over every sample (shales included), not pay-only"
     }
 
 
@@ -1117,7 +1169,11 @@ def compute_sonic_porosity_wyllie(
     if not dt_col:
         raise ValueError(f"Compressional sonic curve (DTCOMP/DT) not found in {well_id}")
         
+    if dt_fluid == dt_matrix:
+        raise ValueError("dt_fluid and dt_matrix must differ")
     sub = df[(df["DEPTH"] >= top_depth) & (df["DEPTH"] <= bottom_depth)].dropna(subset=["DEPTH", dt_col]).copy()
+    if sub.empty:
+        raise ValueError(f"No sonic samples between {top_depth}m and {bottom_depth}m for {well_id}")
     depths = sub["DEPTH"].values
     dt = sub[dt_col].values
     
@@ -1146,7 +1202,7 @@ def compute_sonic_porosity_wyllie(
     
     return {
         "well_id": well_id,
-        "figure_json": _tag(fig, "1d").to_json(),
+        "figure_json": _tag(fig, "1d", well_id).to_json(),
         "avg_sonic_porosity": round(float(np.nanmean(phi_sonic)), 4),
         "dt_matrix": dt_matrix,
         "dt_fluid": dt_fluid
@@ -1161,10 +1217,10 @@ def scan_reservoir_sweetspots(well_id: str, min_thickness: float = 1.5) -> Dict[
     depths = df["DEPTH"].values
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     
-    # Shared Vsh/Phi/Sw derivation across entire well (linear GR Vsh)
+    # Same Vsh/Phi/Sw recipe as compute_net_pay, so a zone found here gives
+    # the same pay thickness when passed back into net pay.
     vsh, phi, sw, _methods = derive_vsh_phi_sw(
-        df, cols, gr_method="linear", phi_clip=(0.0, 0.40), phi_default=0.10,
-        den_candidates=("DENB",))
+        df, cols, gr_bounds=_well_gr_bounds(df), **PAY_MODEL)
 
     # Pay criteria: Vsh <= 0.3, Phi >= 0.1, Sw <= 0.5
     is_pay = ((vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF) & (sw <= SW_CUTOFF)
@@ -1182,10 +1238,13 @@ def scan_reservoir_sweetspots(well_id: str, min_thickness: float = 1.5) -> Dict[
             avg_p = float(np.mean(z_phi))
             avg_s = float(np.mean(z_sw))
             hcpv = thickness * avg_p * (1.0 - avg_s)
+            # Report zone edges half a step outside the first/last pay sample:
+            # base - top then equals thickness, and rounding to 2 dp can never
+            # drop an edge sample when the zone is passed back into net pay.
             zones.append({
                 "zone_name": f"Sweet Spot {len(zones) + 1}",
-                "top_depth": round(float(z_depths[0]), 2),
-                "base_depth": round(float(z_depths[-1]), 2),
+                "top_depth": round(float(z_depths[0] - med_step / 2.0), 2),
+                "base_depth": round(float(z_depths[-1] + med_step / 2.0), 2),
                 "thickness_m": round(thickness, 2),
                 "avg_porosity": round(avg_p, 4),
                 "avg_sw": round(avg_s, 4),
@@ -1223,22 +1282,26 @@ def compute_permeability_timur_coates(
     cols = {c.upper(): c for c in sub.columns}
     med_step = float(np.median(np.diff(depths))) if len(depths) > 1 else 0.1524
     
-    # Shared Phi/Sw derivation (Timur/Coates transforms below stay tool-specific)
-    _, phi, sw, _methods = derive_vsh_phi_sw(
-        sub, cols, phi_default=0.20, sw_default=0.40, den_candidates=("DENB",))
+    # Same Vsh/Phi/Sw recipe as net pay (Timur/Coates transforms below stay tool-specific)
+    vsh, phi, sw, _methods = derive_vsh_phi_sw(
+        sub, cols, gr_bounds=_well_gr_bounds(df), **PAY_MODEL)
 
     phi_safe = np.clip(phi, 0.01, 0.45)
     swirr = np.clip(np.minimum(sw, 0.05 / phi_safe), 0.05, 0.95)
-    
+
     if model.lower() == "coates":
         k_md = np.power(100.0 * np.square(phi_safe) * ((1.0 - swirr) / swirr), 2.0)
     else:
         k_md = 0.136 * (np.power(phi_safe * 100.0, 4.4)) / np.square(swirr * 100.0)
-        
+
     k_md = np.clip(k_md, 0.001, 20000.0)
-    kh_total = float(np.nansum(k_md * med_step))
-    avg_k = float(np.nanmean(k_md))
-    max_k = float(np.nanmax(k_md))
+    # Timur/Coates are only meaningful in clean reservoir rock, so kh and the
+    # averages count net-pay samples only; shales would otherwise inflate kh.
+    is_pay = ((vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF) & (sw <= SW_CUTOFF)
+              & ~np.isnan(vsh) & ~np.isnan(phi) & ~np.isnan(sw) & ~np.isnan(k_md))
+    kh_total = float(np.sum(k_md[is_pay]) * med_step)
+    avg_k = float(np.mean(k_md[is_pay])) if np.any(is_pay) else 0.0
+    max_k = float(np.max(k_md[is_pay])) if np.any(is_pay) else 0.0
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=k_md, y=depths, name=f"Permeability ({model.capitalize()})", line=dict(color="#0284c7", width=1.5)))
@@ -1258,11 +1321,14 @@ def compute_permeability_timur_coates(
         "model": model,
         "top_depth": top_depth,
         "bottom_depth": bottom_depth,
-        "figure_json": _tag(fig, "1d").to_json(),
+        "figure_json": _tag(fig, "1d", well_id).to_json(),
         "average_permeability_md": round(avg_k, 2),
         "max_permeability_md": round(max_k, 2),
         "flow_capacity_kh_md_m": round(kh_total, 2),
-        "reservoir_quality_class": _perm_quality_class(avg_k)
+        "net_pay_samples": int(np.sum(is_pay)),
+        "basis": "kh and averages over net-pay samples only (Vsh/Phi/Sw cutoffs as net pay)",
+        "reservoir_quality_class": (_perm_quality_class(avg_k) if np.any(is_pay)
+                                    else "No net pay in interval")
     }
 
 
@@ -1340,7 +1406,7 @@ def plot_crossplot_picket(
         "m": m,
         "n": n,
         "samples_plotted": int(np.sum(valid)),
-        "figure_json": _tag(fig, "2d").to_json()
+        "figure_json": _tag(fig, "2d", well_id).to_json()
     }
 
 
@@ -1789,7 +1855,7 @@ def plot_3d_petrophysical_cube(
             fname: int(np.sum(facies_arr == fname))
             for fname, _ in facies_config
         },
-        "figure_json": _tag(fig, "3d").to_json()
+        "figure_json": _tag(fig, "3d", well_id).to_json()
     }
 
 
@@ -1832,6 +1898,8 @@ def plot_3d_wellbore_trajectory(
     tvd_col = cols.get("TVDSS") or cols.get("TVD")
     tvd = sub[tvd_col].values if tvd_col else -depths
 
+    # ILLUSTRATIVE path: the LAS files carry no deviation survey (MD/inc/azi),
+    # so XY is a smooth synthetic curve, not a minimum-curvature trajectory.
     # Always use the well's absolute start as the deviation reference so that
     # the displayed (filtered) trace and any beacon highlight share the same XY frame.
     d0 = df["DEPTH"].values[0]
@@ -1839,18 +1907,16 @@ def plot_3d_wellbore_trajectory(
     dev_y = 60.0 * (1.0 - np.cos((depths - d0) / 180.0))
     z = tvd
 
-    # Shared Vsh/Phi/Sw derivation (linear GR Vsh; rdeep kept for coloring)
+    # Same Vsh/Phi/Sw recipe as net pay and the sweet-spot scanner
     vsh, phi, sw, _methods = derive_vsh_phi_sw(
-        sub, cols, gr_method="linear", phi_clip=(0.0, 0.40), phi_default=0.15,
-        den_candidates=("DENB",), rdeep_candidates=("RDEEP", "ILD", "RT"),
-        rdeep_default=10.0)
+        sub, cols, gr_bounds=_well_gr_bounds(df), **PAY_MODEL)
 
     rdeep_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
     rdeep_vals = sub[rdeep_col].values if rdeep_col else np.full(len(depths), 10.0)
     rdeep_vals = np.maximum(rdeep_vals, 0.1)
 
     is_pay = ((vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF) & (sw <= SW_CUTOFF)
-              & (~np.isnan(depths)))
+              & (~np.isnan(depths)) & (~np.isnan(vsh)) & (~np.isnan(phi)) & (~np.isnan(sw)))
 
     fig = go.Figure()
 
@@ -1936,13 +2002,14 @@ def plot_3d_wellbore_trajectory(
                 name="Hydrocarbon Pay Zone (Sweet Spot)"
             ))
 
-    # ── Geological Reservoir Horizon ────────────────────────────────────────
+    # ── Illustrative Top-Pay Surface ────────────────────────────────────────
+    # NOT a mapped horizon: there are no picked tops from other wells to grid,
+    # so this is a decorative surface anchored at the first pay sample. Its
+    # dip and undulation are invented and must not be reported as measured.
     if show_horizon and np.any(is_pay):
         pay_top_z = float(z[is_pay][0])
         gx, gy = np.meshgrid(np.linspace(-160, 160, 40), np.linspace(-120, 220, 40))
-        # Structural dip: 3.5 cm/m East (0.035), -2 cm/m North (−0.020)
         dip_x, dip_y = 0.042, -0.025
-        # Realistic undulation: low-amplitude sinusoidal fault drag
         undulation = (
             3.5 * np.sin(gx / 80.0) * np.cos(gy / 110.0)
             + 1.8 * np.sin(gx / 45.0 + 0.7)
@@ -1967,14 +2034,13 @@ def plot_3d_wellbore_trajectory(
             contours=dict(
                 z=dict(show=True, usecolormap=True, width=1.5, project=dict(z=False))
             ),
-            hovertemplate="Horizon TVDSS: %{z:.1f} m<extra>Top Reservoir Horizon</extra>",
-            name="Top Reservoir Horizon"
+            hovertemplate="Surface z: %{z:.1f} m<extra>Illustrative top-pay surface</extra>",
+            name="Illustrative Top-Pay Surface"
         ))
 
         # Elevated leader-line pin above the horizon
         pin_x = float(dev_x[np.where(is_pay)[0][0]])
         pin_y = float(dev_y[np.where(is_pay)[0][0]])
-        dip_deg = float(np.degrees(np.arctan(np.sqrt(dip_x**2 + dip_y**2))))
         label_z_offset = abs(float(z.max() - z.min())) * 0.08 + 12.0
 
         # Vertical leader line from horizon to label
@@ -1995,11 +2061,11 @@ def plot_3d_wellbore_trajectory(
             z=[pay_top_z - label_z_offset],
             mode="text+markers",
             marker=dict(size=9, color="#f59e0b", symbol="diamond", line=dict(color="#b45309", width=1.5)),
-            text=[f"<b>Marker: Top Reservoir Horizon</b><br>TVDSS ≈ {abs(pay_top_z):.1f} m | Dip: ~{dip_deg:.1f}° SE"],
+            text=[f"<b>First pay sample</b><br>{'TVDSS' if tvd_col else 'MD'} ≈ {abs(pay_top_z):.1f} m"],
             textposition="top center",
             textfont=dict(color="#78350f", size=11, family="monospace"),
             hoverinfo="text",
-            name="Formation Top Pick"
+            name="First Pay Sample"
         ))
 
     # ── Sweet Spot Highlight Beacon ──────────────────────────────────────────
@@ -2080,7 +2146,8 @@ def plot_3d_wellbore_trajectory(
             z_margin = float(np.clip(hl_thickness * 8.0, 20.0, 90.0))
             hl_focus = (mx, my, mz, xy_margin, z_margin)
 
-    fig_title = f"<b>3D Subsurface Wellbore Trajectory: {well_id}</b> (Color by: {active_attr.upper()})"
+    fig_title = (f"<b>3D Wellbore View (illustrative path): {well_id}</b> "
+                 f"(Color by: {active_attr.upper()})")
     if has_highlight:
         if highlight_matched:
             fig_title += f" | Target Zone {highlight_top:.0f}–{highlight_base:.0f}m"
@@ -2090,9 +2157,9 @@ def plot_3d_wellbore_trajectory(
         title=fig_title,
         template="plotly_white",
         scene=dict(
-            xaxis_title="Easting X (m)",
-            yaxis_title="Northing Y (m)",
-            zaxis_title="Subsea Depth TVDSS (m)",
+            xaxis_title="X offset (m, illustrative)",
+            yaxis_title="Y offset (m, illustrative)",
+            zaxis_title="TVDSS (m)" if tvd_col else "-MD (m, no TVD curve)",
             camera=dict(eye=dict(x=1.65, y=1.65, z=0.95)),
             bgcolor="#F8FAFC"
         ),
@@ -2130,6 +2197,8 @@ def plot_3d_wellbore_trajectory(
         "view_top_m": float(view_top) if view_top is not None else None,
         "view_base_m": float(view_bot) if view_bot is not None else None,
         "highlight_matched": bool(highlight_matched) if has_highlight else None,
-        "figure_json": _tag(fig, "3d").to_json()
+        "note": ("Illustrative view: XY path and top-pay surface are synthetic (no deviation "
+                 "survey or mapped tops in the data); depth coloring and pay flags are computed."),
+        "figure_json": _tag(fig, "3d", well_id).to_json()
     }
 

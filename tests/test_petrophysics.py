@@ -141,6 +141,98 @@ def test_3d_trajectory():
     print("[PASS] 3D Subsurface Wellbore Trajectory & Horizon verified.")
 
 
+def test_figure_meta_tags():
+    from backend.petrophysics import plot_3d_petrophysical_cube
+    cases = [
+        (plot_1d_well_log("Well1", top_depth=1850.0, bottom_depth=1950.0), "1d", "Well1"),
+        (plot_2d_crossplot("Well1", x_curve="NEUT", y_curve="DENB", z_curve="GR", top_depth=1850.0, bottom_depth=1950.0), "2d", "Well1"),
+        (plot_3d_wellbore_trajectory("Well2", top_depth=3649.0, bottom_depth=3734.0), "3d", "Well2"),
+        (plot_3d_petrophysical_cube("Well1", top_depth=1850.0, bottom_depth=1950.0), "3d", "Well1"),
+    ]
+    for res, kind, well in cases:
+        meta = json.loads(res["figure_json"])["layout"].get("meta") or {}
+        assert meta.get("plot_kind") == kind, f"plot_kind for {well}: {meta}"
+        assert meta.get("well_id") == well, f"well_id tag: {meta}"
+    print("[PASS] Figure layout.meta plot_kind + well_id tags verified.")
+
+
+# --- Regression tests for the audit findings -------------------------------
+
+def test_ntg_never_exceeds_one_in_all_pay_zone():
+    zone = scan_reservoir_sweetspots("Well1")["sweetspots"][0]
+    res = compute_net_pay("Well1", zone["top_depth"], zone["base_depth"])
+    assert res["net_pay_m"] <= res["gross_interval_m"]
+    assert res["net_to_gross"] <= 1.0
+
+
+def test_scanner_and_net_pay_agree_on_same_zone():
+    for well in ("Well1", "Well2"):
+        zone = scan_reservoir_sweetspots(well)["sweetspots"][0]
+        res = compute_net_pay(well, zone["top_depth"], zone["base_depth"])
+        assert abs(res["net_pay_m"] - zone["thickness_m"]) < 0.01, (well, zone, res["net_pay_m"])
+
+
+def test_net_pay_is_additive_across_windows():
+    # Well2 has no VSHALE log, so this exercises the GR-derived Vsh path.
+    # Split at a depth between samples so no sample is counted twice.
+    whole = compute_net_pay("Well2", 3600.0, 3700.0)["net_pay_m"]
+    upper = compute_net_pay("Well2", 3600.0, 3650.05)["net_pay_m"]
+    lower = compute_net_pay("Well2", 3650.05, 3700.0)["net_pay_m"]
+    assert abs((upper + lower) - whole) < 0.01
+
+
+def test_kh_counts_pay_only():
+    res = compute_permeability_timur_coates("Well2", 3590.0, 3850.0)
+    net = compute_net_pay("Well2", 3590.0, 3850.0)
+    assert res["net_pay_samples"] > 0
+    # Sum over pay samples only: kh / avg k is the pay thickness.
+    assert abs(res["flow_capacity_kh_md_m"] / res["average_permeability_md"] - net["net_pay_m"]) < 0.5
+
+
+def test_well_id_cannot_escape_data_dir():
+    import pytest
+    for bad in ("../data/Well1.las", str(BASE_DIR / "data" / "Well1.las"), "..\\Well1"):
+        with pytest.raises(FileNotFoundError):
+            get_well_curves_summary(bad)
+
+
+def test_sonic_empty_interval_raises():
+    import pytest
+    with pytest.raises(ValueError):
+        compute_sonic_porosity_wyllie("Well1", 99990.0, 99999.0)
+
+
+def test_api_error_codes():
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post("/api/chat", json={"message": "  "}).status_code == 400
+    assert client.post("/api/tools/sonic_porosity",
+                       json={"well_id": "Well1", "top_depth": 99990, "bottom_depth": 99999}).status_code == 400
+    assert client.post("/api/tools/net_pay",
+                       json={"well_id": "NoSuchWell", "top_depth": 1, "bottom_depth": 2}).status_code == 404
+
+
+def test_offline_summary_is_grounded():
+    from backend.agent import _generate_offline_summary
+    out = _generate_offline_summary("What is the net pay in this interval of Well 2?", [], [], "Well1")
+    assert "Offline summary" in out["text"]
+    assert "### Well2" in out["text"]  # "this" must not trigger the greeting branch
+    assert {t["name"] for t in out["tool_calls"]} >= {"scan_reservoir_sweetspots", "generate_reservoir_composite_report"}
+    # Every value in the table must come from the recorded composite report.
+    comp = next(t["result"] for t in out["tool_calls"] if t["name"] == "generate_reservoir_composite_report")
+    assert f"{comp['net_pay_m']:.2f} m" in out["text"]
+
+
+def test_mcp_server_imports_as_script():
+    import subprocess
+    code = ("import runpy, sys; sys.argv=['x']; "
+            "g = runpy.run_path(r'%s', run_name='not_main'); print('ok')" % (BASE_DIR / "backend" / "mcp_server.py"))
+    out = subprocess.run([sys.executable, "-c", code], cwd=str(BASE_DIR / "backend"),
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr[-500:]
+
+
 if __name__ == "__main__":
     test_catalog()
     test_curves_summary()
@@ -156,4 +248,5 @@ if __name__ == "__main__":
     test_reservoir_composite_report()
     test_3d_cube()
     test_3d_trajectory()
+    test_figure_meta_tags()
     print("\n>>> ALL 14 PETROPHYSICAL TOOLS PASSED VERIFICATION! <<<")

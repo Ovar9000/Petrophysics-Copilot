@@ -4,8 +4,18 @@ Exposes deterministic subsurface calculation and visualization tools
 via the Model Context Protocol (MCP) for Claude Desktop, Cursor, or MCP clients.
 """
 
-from typing import Optional
+from pathlib import Path
+from typing import Any, Dict, Optional
 import json
+import sys
+
+# Allow `python backend/mcp_server.py` (how MCP clients launch it): running a
+# file as a script puts backend/ on sys.path, not the repo root, so the
+# `backend.` imports below would fail without this.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 try:
     from mcp.server.mcpserver import MCPServer as MCP
 except ImportError:
@@ -44,6 +54,15 @@ from backend.catalog import query_catalog
 mcp = MCP("WellLogPetrophysicsMCP")
 
 
+def _without_figure(res: Dict[str, Any]) -> str:
+    """MCP results go straight into the client model's context; a Plotly
+    figure is megabytes of JSON the model cannot use, so return numbers only."""
+    out = {k: v for k, v in res.items() if k != "figure_json"}
+    if "figure_json" in res:
+        out["figure"] = "omitted (view plots in the web UI)"
+    return json.dumps(out, indent=2)
+
+
 @mcp.tool()
 def get_well_curves_summary(well_id: str) -> str:
     """Inspects the .las file and returns available curve mnemonics, units, and depth bounds."""
@@ -60,7 +79,7 @@ def plot_1d_well_log(
 ) -> str:
     """Generates an interactive 3-track petrophysical log plot (GR/Caliper, Resistivity, Density-Neutron crossover)."""
     res = _plot_1d_well_log(well_id, top_depth, bottom_depth, marker_depth)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -74,7 +93,7 @@ def plot_2d_crossplot(
 ) -> str:
     """Generates an interactive 2D lithology crossplot (e.g. RHOB vs NPHI) with mineral trendlines."""
     res = _plot_2d_crossplot(well_id, x_curve, y_curve, z_curve, top_depth, bottom_depth)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -95,7 +114,7 @@ def compute_net_pay(
 def compare_vshale_methods(well_id: str, top_depth: float, bottom_depth: float) -> str:
     """Compares 4 shale volume calculation methods (Linear, Larionov Tertiary, Steiber, Clavier)."""
     res = _compare_vshale_methods(well_id, top_depth, bottom_depth)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -109,7 +128,7 @@ def calculate_archie_saturation(
 ) -> str:
     """Computes continuous Archie water saturation (Sw), hydrocarbon saturation (So), and Bulk Volume Hydrocarbon (BVH)."""
     res = _calculate_archie_saturation(well_id, top_depth, bottom_depth, rw, m, n)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -122,7 +141,7 @@ def compute_sonic_porosity_wyllie(
 ) -> str:
     """Calculates Wyllie time-average sonic porosity from compressional sonic logs (DTCOMP)."""
     res = _compute_sonic_porosity_wyllie(well_id, top_depth, bottom_depth, dt_matrix, dt_fluid)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -141,7 +160,7 @@ def compute_permeability_timur_coates(
 ) -> str:
     """Calculates continuous reservoir permeability (k in mD) and flow capacity (k*h in mD*m)."""
     res = _compute_permeability_timur_coates(well_id, top_depth, bottom_depth, model)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -155,7 +174,7 @@ def plot_crossplot_picket(
 ) -> str:
     """Generates a classic Archie Picket Plot (log(Rt) vs log(Phi)) with 100% water line and iso-saturation trendlines."""
     res = _plot_crossplot_picket(well_id, top_depth, bottom_depth, rw, m, n)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -173,7 +192,7 @@ def plot_3d_petrophysical_cube(
 ) -> str:
     """Generates an advanced 3D Petrophysical Cluster Space (NPHI vs RHOB vs DT) with mineral matrix surfaces and density shells."""
     res = _plot_3d_petrophysical_cube(well_id, top_depth, bottom_depth)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()
@@ -184,7 +203,7 @@ def plot_3d_wellbore_trajectory(
 ) -> str:
     """Generates an interactive 3D Subsurface Wellbore Trajectory with true spatial path and reservoir horizon surface."""
     res = _plot_3d_wellbore_trajectory(well_id, top_depth, bottom_depth)
-    return json.dumps(res)
+    return _without_figure(res)
 
 
 @mcp.tool()

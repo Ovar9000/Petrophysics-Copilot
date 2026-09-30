@@ -1,6 +1,6 @@
 # Petrophysical Copilot: Autonomous Subsurface Analytics & RAG Engine
 
-[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://python.org) [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com) [![React 18](https://img.shields.io/badge/Frontend-React%2018%20%7C%20TypeScript-61DAFB.svg?logo=react&logoColor=black)](https://react.dev) [![Plotly](https://img.shields.io/badge/Visualization-Plotly.js-3F4F75.svg?logo=plotly&logoColor=white)](https://plotly.com) [![Gemini](https://img.shields.io/badge/LLM-Google%20Gemini%20API-4285F4.svg?logo=google&logoColor=white)](https://ai.google.dev) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg?logo=python&logoColor=white)](https://python.org) [![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com) [![React 19](https://img.shields.io/badge/Frontend-React%2019%20%7C%20TypeScript-61DAFB.svg?logo=react&logoColor=black)](https://react.dev) [![Plotly](https://img.shields.io/badge/Visualization-Plotly.js-3F4F75.svg?logo=plotly&logoColor=white)](https://plotly.com) [![Gemini](https://img.shields.io/badge/LLM-Google%20Gemini%20API-4285F4.svg?logo=google&logoColor=white)](https://ai.google.dev) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 An enterprise-grade, **hybrid agentic petrophysics platform** that pairs **Large Language Model (LLM) reasoning** with a **deterministic subsurface computing engine**. Designed with a modern energy-tech aesthetic (SLB Techlog & Palantir Foundry inspired), this platform enables geoscientists, reservoir engineers, and data teams to interactively explore raw well logs (.LAS), calculate cutoffs and fluid saturations, crossplot mineral matrices, and inspect 3D petrophysical spaces using conversational natural language or high-speed UI controls.
 
@@ -27,10 +27,10 @@ The platform is purpose-built to deliver **real-time visualization, retrieval, a
 
 | Pillar | Technical Mechanism | Subsurface Realization |
 | :--- | :--- | :--- |
-| **Real-Time Visualization** | High-performance Plotly.js + React 18 deck | • **1D Multi-Track Logs**: 3 synchronized tracks (GR/Caliper with washout & mudcake fills, log Resistivity, Density-Neutron crossover, synchronized spikeline depth correlation).<br>• **2D Lithology Crossplots**: Inverted RHOB vs NPHI with Quartz/Calcite/Dolomite calibration lines and Gas Correction Vector.<br>• **3D Cluster Space**: Snug petrophysical cube with mineral matrix sheet, floor/wall shadow projections, and 50%/80% density hulls.<br>• **3D Trajectory**: True spatial wellbore path ($X, Y, \text{TVDSS}$) with reservoir top formation surface. |
+| **Real-Time Visualization** | High-performance Plotly.js + React 19 deck | • **1D Multi-Track Logs**: 3 synchronized tracks (GR/Caliper with washout & mudcake fills, log Resistivity, Density-Neutron crossover, synchronized spikeline depth correlation).<br>• **2D Lithology Crossplots**: Inverted RHOB vs NPHI with Quartz/Calcite/Dolomite calibration lines and Gas Correction Vector.<br>• **3D Cluster Space**: Snug petrophysical cube with mineral matrix sheet, floor/wall shadow projections, and 50%/80% density hulls.<br>• **3D Wellbore View**: Depth-true wellbore colored by computed pay flags; the XY path and top-pay surface are illustrative (the LAS files contain no deviation survey or mapped tops). |
 | **Subsurface Retrieval** | Stratigraphy Catalog + Dynamic LAS depth slicing | • **Tabular Log Retrieval**: Slicing raw `.las` curve arrays on-demand based on requested depth boundaries.<br>• **Geological Report Retrieval**: Catalog lookup for formation tops, stratigraphy summaries, and mudlog hydrocarbon show notes directly from well geology reports. |
 | **Parameter Computation** | Vectorized deterministic Python engine | • **Volumetric Net Pay**: Gross interval, Net Reservoir, Net Pay, and Net-to-Gross ($NTG$).<br>• **Fluid Saturations**: Archie water saturation ($S_w$), hydrocarbon saturation ($S_o$), Bulk Volume Hydrocarbons ($BVH$).<br>• **Permeability & Flow**: Timur and Coates continuous permeability ($k$) and flow capacity ($k \cdot h$).<br>• **Porosity & Shale**: Wyllie time-average sonic porosity and multi-model $V_{\text{sh}}$ comparison (Linear, Larionov, Steiber, Clavier). |
-| **Based on User Requests** | Autonomous Agentic Function Calling | • Plain English queries (e.g., *"Evaluate reservoir net pay and crossplot Well 2 between 3650m and 3750m"*) automatically trigger parameter extraction, deterministic tool execution, visual tab synchronization, and executive technical briefs in sub-second latency. |
+| **Based on User Requests** | Autonomous Agentic Function Calling | • Plain English queries (e.g., *"Evaluate reservoir net pay and crossplot Well 2 between 3650m and 3750m"*) trigger parameter extraction, deterministic tool execution, visual tab synchronization, and a short written summary grounded in the tool results. |
 
 ---
 
@@ -38,8 +38,8 @@ The platform is purpose-built to deliver **real-time visualization, retrieval, a
 
 ```mermaid
 flowchart TB
-    subgraph Frontend["Modern React Studio (Port 3000)"]
-        UI_Tree["Well Explorer Tree\n(Well 1, Well 2, Presets)"]
+    subgraph Frontend["React UI (Port 3000)"]
+        UI_Tree["Active Well Selector\n(Well 1, Well 2)"]
         UI_Chat["Conversational Copilot\n(Markdown, LaTeX, Tool Badges)"]
         UI_Deck["Interactive Plotly Deck\n(1D Curves | 2D Crossplot | 3D Cube | Net Pay KPIs)"]
     end
@@ -57,7 +57,7 @@ flowchart TB
     end
 
     UI_Tree -->|Switch Active Well| UI_Deck
-    UI_Tree -->|Quick Presets| UI_Chat
+    UI_Tree -->|Active well sent with each message| UI_Chat
     UI_Chat <-->|HTTP POST /api/chat| Router
     UI_Deck <-->|Direct Tool Calls| Router
     Router --> Orchestrator
@@ -96,7 +96,7 @@ sequenceDiagram
     Agent->>Gemini: Function Result JSON
     Gemini-->>Agent: Final Response with executive markdown, LaTeX, and geological insight
     Agent-->>API: Synthesized Response + Tool Execution Audit Badge
-    API-->>UI: Streaming Chat + Auto-sync Plotly Deck Tab
+    API-->>UI: Chat response + figures (auto-selects Plotly deck tab)
     UI-->>User: Visual KPI Cards + Multi-track Curve View
 ```
 
@@ -104,7 +104,7 @@ sequenceDiagram
 - **`backend/main.py`**: High-throughput FastAPI application exposing REST endpoints for chat sessions, individual petrophysical calculations, and dynamic Plotly figure generation.
 - **`backend/agent.py`**: The agent runtime. Maintains conversational state, formats petrophysical system prompts, sends strict OpenAPI tool schemas to Gemini, dispatches tool executions, and handles multi-turn loops until final synthesis is reached.
 - **`backend/petrophysics.py`**: Pure, deterministic subsurface math engine. Uses `lasio` for high-fidelity LAS reading, standardizes mnemonic curve names (e.g. `CNC`, `NPHI` -> Neutron; `RHOB`, `DENB` -> Bulk Density), executes vector math via `numpy`/`scipy`, and builds responsive multi-track Plotly figures.
-- **`backend/catalog.py`**: Stratigraphy and mudlog catalog. Indexes geological tops, formation summaries, and hydrocarbon mudlog shows with structured local metadata caching.
+- **`backend/catalog.py`**: Stratigraphy and mudlog catalog. Loads the two geology reports into memory and ranks them by keyword matches (lexical retrieval, no vector store).
 - **`backend/mcp_server.py`**: Model Context Protocol (MCP) implementation exposing all petrophysical routines to Claude Desktop, Cursor, or any MCP-compliant sidecar.
 
 ---
@@ -201,7 +201,7 @@ Builds an advanced 3D petrophysical inspection space:
 <details>
 <summary><b>5. <code>plot_3d_wellbore_trajectory</code> — True 3D Spatial Wellbore & Pay Horizon</b></summary>
 
-Renders the true 3D spatial trajectory ($X, Y, \text{TVDSS}$) using minimum curvature calculation, colored by hydrocarbon pay flags and framed by the regional reservoir top formation surface.
+Renders a 3D wellbore view colored by computed hydrocarbon pay flags (TVDSS when the LAS has it, otherwise MD). The XY path and the top-pay surface are **illustrative**: the data has no deviation survey, so no minimum-curvature trajectory is computed, and the surface is not a mapped horizon.
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -309,7 +309,7 @@ Step 5: Synthesize executive summary with markdown, KPI highlights, and guidance
 The React interface keeps visual components synchronized with the agent:
 - **Badge Audit Trail**: Every tool invoked by the agent renders as a clickable, expandable badge (`compute_net_pay`, `query_geology_metadata`) showing exact inputs and outputs.
 - **Synchronized Tab Switching**: Invoking a 2D crossplot or 3D cube automatically surfaces the corresponding tab in the right-hand inspection deck.
-- **Active Well Binding**: Changing the selected well in the sidebar updates the context of the copilot. Clicking well toggles directly inside Plotly plots triggers cross-component synchronization.
+- **Active Well Binding**: The well selected in the header is sent with each chat message and used when a question names no well. Clicking well toggles directly inside Plotly plots triggers cross-component synchronization.
 
 ---
 
@@ -337,7 +337,7 @@ To maintain engineering integrity, users should note the following physical and 
 <summary><b>3. Large Context Windows & Token Limits</b></summary>
 
 - Raw 1-second or 0.1524m log sampling over a 3,000m well produces over 20,000 depth rows. Transmitting raw tabular arrays directly to the LLM would overwhelm context windows and cause hallucinated calculations.
-- **Strict Boundary**: All raw data slicing, filtering, and statistical aggregations occur on the server in Python. The LLM receives compact JSON summaries and statistical metrics, guaranteeing 100% deterministic accuracy.
+- **Strict Boundary**: All raw data slicing, filtering, and statistical aggregations occur on the server in Python. The LLM receives compact JSON summaries and statistical metrics, so every reported number is computed deterministically rather than generated by the model.
 </details>
 
 ---
@@ -441,16 +441,15 @@ well_log_rag_analytics/
 │   ├── Well1_geology_report.md # Geological stratigraphy & mudlog notes
 │   └── Well2_geology_report.md # Geological stratigraphy & mudlog notes
 │
-├── frontend-react/             # Production React 18 + TypeScript + Tailwind Studio
+├── frontend-react/             # React 19 + TypeScript + Tailwind UI
 │   ├── index.html              # HTML entry point
 │   ├── package.json            # Node dependencies
 │   ├── vite.config.ts          # Vite configuration & proxy routes
 │   └── src/
 │       ├── App.tsx             # Three-panel layout orchestrator
 │       ├── components/
-│       │   ├── ChatInterface.tsx # Conversational copilot with streaming & badges
-│       │   ├── PlotlyDeck.tsx    # 1D/2D/3D multi-tab Plotly visualization deck
-│       │   └── Sidebar.tsx       # Well tree, depth intervals, & analytical presets
+│       │   ├── ChatStream.tsx    # Chat panel with markdown answers & tool badges
+│       │   └── PlotlyDeck.tsx    # 1D/2D/3D multi-tab Plotly visualization deck
 │
 └── tests/                      # Automated test suite
     └── test_petrophysics.py    # Unit tests for cutoffs, Archie, Vshale, & crossplots

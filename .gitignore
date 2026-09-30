@@ -13,7 +13,8 @@ data/*.h5
 data/*.feather
 data/metadata_cache.json
 !data/.gitkeep
-!data/*_geology_report.md
+data/*_geology_report.md
+data/*.md
 
 # ==============================================================================
 # Environment Configuration & Secrets

@@ -20,13 +20,11 @@ export const App: React.FC = () => {
     {
       id: 'init-1',
       role: 'assistant',
-      content: `### Multi-Well Asset Workspace Ready
-Both field wells are loaded in memory for integrated subsurface evaluation:
+      content: `### Two wells loaded
+* **Well 1**: 0–2500 m MD, 25 curves. A good starting interval is **1850–1950 m**.
+* **Well 2**: 1176–3960 m MD, 11 curves. A good starting interval is **3590–3850 m**.
 
-* **Well 1 (Target Alpha · 0–2500m MD)**: Prolific shoreface gas sandstone interval between **1850m and 1950m** (primary pay zone: 1906.1m – 1914.6m).
-* **Well 2 (Exploration Beta · 1176–3960m MD)**: Deep exploration section featuring **28 stacked hydrocarbon sweet spots** between **3590m and 3850m**.
-
-Ask any question about either well individually, request a cross-well comparison (e.g. *"Compare the reservoir sweet spots in both Well 1 and Well 2"*), or explore interactive 1D log curves and 3D subsurface models on the right.`,
+Ask about either well (e.g. *"Show the 1D log for Well 1 from 1850 to 1950 m"* or *"Compute net pay for Well 2 between 3650 and 3750 m"*), or use the plots on the right. Every number in an answer comes from a tool run, shown in the expandable badges.`,
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     }
   ]);

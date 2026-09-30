@@ -1,10 +1,13 @@
 """FastAPI backend application for Petrophysical Copilot.
 """
 
+import json
+import math
 from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
-from fastapi import FastAPI, HTTPException
+from typing import Any, Dict, List, Optional
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from backend.config import DATA_DIR
@@ -32,20 +35,52 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def _nan_to_none(obj: Any) -> Any:
+    """NaN/inf are not valid JSON; send them as null instead of crashing."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
+    if isinstance(obj, dict):
+        return {k: _nan_to_none(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_nan_to_none(v) for v in obj]
+    return obj
+
+
+class SafeJSONResponse(JSONResponse):
+    def render(self, content: Any) -> bytes:
+        return json.dumps(_nan_to_none(content), ensure_ascii=False,
+                          allow_nan=False, separators=(",", ":")).encode("utf-8")
+
+
 app = FastAPI(
     title="Petrophysical Copilot API",
     version="2.0.0",
     description="Streamlined, high-performance subsurface analytics engine.",
     lifespan=lifespan,
+    default_response_class=SafeJSONResponse,
 )
 
+# The UI calls the API cross-origin (port 3000 -> 8000) without cookies, so
+# credentials stay off; a wildcard origin with credentials is not allowed.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Engine functions raise these for bad input (unknown well, empty interval);
+# report them as client errors instead of a bare 500.
+@app.exception_handler(FileNotFoundError)
+async def _not_found(_: Request, exc: FileNotFoundError):
+    return SafeJSONResponse(status_code=404, content={"detail": str(exc)})
+
+
+@app.exception_handler(ValueError)
+async def _bad_request(_: Request, exc: ValueError):
+    return SafeJSONResponse(status_code=400, content={"detail": str(exc)})
 
 
 class ChatRequest(BaseModel):
@@ -178,7 +213,7 @@ def chat_endpoint(req: ChatRequest):
         if not active_query:
             raise HTTPException(status_code=400, detail="Query message required.")
             
-        response = run_agent_turn(active_query, req.chat_history)
+        response = run_agent_turn(active_query, req.chat_history, req.well_id)
         return {
             "text": response.get("text", ""),
             "figures": response.get("figures", []),
@@ -186,6 +221,8 @@ def chat_endpoint(req: ChatRequest):
             "session_id": req.session_id,
             "well_id": req.well_id or "Well1"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

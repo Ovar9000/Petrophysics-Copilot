@@ -21,6 +21,15 @@ const plotKindOf = (spec: any): PlotKind => {
   return String(title).includes('Crossplot') || String(title).includes('Picket') ? '2d' : '1d';
 };
 
+// Owning well stamped in layout.meta by the backend (_tag). Chat payloads for
+// well B must never overwrite well A's cached view — key by the DATA's well,
+// falling back to the viewed well for legacy/untagged figures.
+const figureWellOf = (spec: any, fallback: string): string => {
+  const tagged = (spec?.layout as any)?.meta?.well_id;
+  const dataWell = typeof tagged === 'string' && tagged ? tagged : fallback;
+  return dataWell.toLowerCase() === fallback.toLowerCase() ? fallback : dataWell;
+};
+
 // Single POST-JSON helper for all tool endpoints (replaces 7 copy-pasted fetches).
 const postTool = async <T,>(path: string, body: unknown): Promise<T | null> => {
   try {
@@ -136,27 +145,33 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     ensureTabData(activeTab, selectedWell);
   }, [selectedWell]);
 
-  // React to sweet spots emitted from chat
+  // React to sweet spots emitted from chat — cached under the DATA's well so a
+  // multi-well turn can never overwrite the other well's view. Tab follows only
+  // when the payload belongs to the well being inspected.
   useEffect(() => {
     if (sweetspotsData && sweetspotsData.sweetspots && sweetspotsData.sweetspots.length > 0) {
+      const dataWell = sweetspotsData.well_id || selectedWell;
+      const well = dataWell.toLowerCase() === selectedWell.toLowerCase() ? selectedWell : dataWell;
       setWellDataCache(prev => ({
         ...prev,
-        [selectedWell]: { ...(prev[selectedWell] || {}), sweetspots: sweetspotsData }
+        [well]: { ...(prev[well] || {}), sweetspots: sweetspotsData }
       }));
-      setActiveTab('sweetspots');
+      if (well === selectedWell) setActiveTab('sweetspots');
     }
   }, [sweetspotsData]);
 
-  // React to figure emitted from chat (kind comes stamped from the backend)
+  // React to figure emitted from chat (kind + owning well stamped by backend)
   useEffect(() => {
     if (activeFigureJson) {
       try {
-        const kind = plotKindOf(JSON.parse(activeFigureJson));
+        const spec = JSON.parse(activeFigureJson);
+        const kind = plotKindOf(spec);
+        const well = figureWellOf(spec, selectedWell);
         setWellDataCache(prev => ({
           ...prev,
-          [selectedWell]: { ...(prev[selectedWell] || {}), [kind]: activeFigureJson }
+          [well]: { ...(prev[well] || {}), [kind]: activeFigureJson }
         }));
-        setActiveTab(kind);
+        if (well === selectedWell) setActiveTab(kind);
       } catch {
         setActiveTab('1d');
       }
@@ -649,7 +664,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   ? 'bg-white text-zinc-900 font-semibold shadow-xs' 
                   : 'text-zinc-500 hover:text-zinc-800'
               }`}
-              title="Inspect Well 1 (Target Alpha)"
+              title="Inspect Well 1"
             >
               Well 1
             </button>
@@ -660,7 +675,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   ? 'bg-white text-zinc-900 font-semibold shadow-xs' 
                   : 'text-zinc-500 hover:text-zinc-800'
               }`}
-              title="Inspect Well 2 (Exploration Beta)"
+              title="Inspect Well 2"
             >
               Well 2
             </button>
@@ -835,7 +850,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                     }`}
                   >
                     <Layers className="w-3.5 h-3.5 text-zinc-600" />
-                    3D Wellbore & Horizon
+                    3D Wellbore (illustrative)
                   </button>
                 </div>
                 <div className="flex items-center gap-2 text-[11px] text-zinc-400 font-mono hidden lg:flex">
@@ -968,8 +983,8 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                       }}
                       className="accent-amber-600 w-3.5 h-3.5"
                     />
-                    <span className="font-semibold">Show Geological Horizon</span>
-                    <span className="text-amber-600/70 text-[10px]">(Top Reservoir Surface · Earth colormap · Dip ~3.1° SE)</span>
+                    <span className="font-semibold">Show Top-Pay Surface</span>
+                    <span className="text-amber-600/70 text-[10px]">(illustrative, not a mapped horizon; wellbore XY path is also illustrative)</span>
                   </label>
                 </div>
               )}
@@ -1233,7 +1248,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                     </div>
                     {currentNetPay.net_pay_uncertainty && (
                       <div className="text-[10px] text-emerald-700 mt-1 font-mono" title={currentNetPay.net_pay_uncertainty.basis}>
-                        P90–P10: {currentNetPay.net_pay_uncertainty.p90_m}–{currentNetPay.net_pay_uncertainty.p10_m} m (±{currentNetPay.net_pay_uncertainty.plus_minus_m})
+                        Cutoff sensitivity (P90–P10): {currentNetPay.net_pay_uncertainty.p90_m}–{currentNetPay.net_pay_uncertainty.p10_m} m (±{currentNetPay.net_pay_uncertainty.plus_minus_m})
                       </div>
                     )}
                   </div>
