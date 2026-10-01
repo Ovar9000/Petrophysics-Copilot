@@ -1,7 +1,10 @@
-"""Chat agent: Gemini chooses tools, the deterministic engine computes.
+"""Chat agent: Gemini chooses tools, the MCP server runs them.
 
-The model only picks tools and fills in their arguments; every number shown
-to the user comes from backend/petrophysics.py or backend/catalog.py.
+Flow per turn: the tool list comes from the MCP server (backend/mcp_server.py)
+via the MCP client (backend/mcp_client.py) and is converted to Gemini function
+declarations; each Gemini functionCall is executed with an MCP call_tool. The
+model only picks tools and fills in arguments; every number shown to the user
+comes from the deterministic engine behind the MCP server.
 """
 
 import logging
@@ -9,225 +12,51 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 import httpx
+from backend import mcp_client
 from backend.config import GEMINI_API_KEY, GEMINI_MODEL
-from backend.petrophysics import (
-    get_well_curves_summary,
-    plot_1d_well_log,
-    plot_2d_crossplot,
-    compute_net_pay,
-    compare_vshale_methods,
-    calculate_archie_saturation,
-    compute_sonic_porosity_wyllie,
-    scan_reservoir_sweetspots,
-    compute_permeability_timur_coates,
-    plot_crossplot_picket,
-    generate_reservoir_composite_report,
-    plot_3d_petrophysical_cube,
-    plot_3d_wellbore_trajectory,
-    default_window,
-    list_well_ids,
-)
-from backend.catalog import query_catalog
+from backend.petrophysics import default_window, get_well_curves_summary, list_well_ids
 
 logger = logging.getLogger(__name__)
 
-TOOLS_DEFINITIONS = [
-    {
-        "name": "get_well_curves_summary",
-        "description": "Inspects the .las file for a given well and returns available curve mnemonics, units, descriptions, and depth bounds.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Identifier of the well (e.g., 'Well1', 'Well2')"}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "plot_1d_well_log",
-        "description": "Generates an interactive 3-track petrophysical log plot (Track 1: Gamma Ray, Track 2: Resistivity on log scale, Track 3: Density-Neutron crossover with reservoir shading) for a specified depth interval.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth interval in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth interval in meters"},
-                "marker_depth": {"type": "NUMBER", "description": "Optional depth (in meters) to draw a continuous horizontal correlation line across all 3 tracks."}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "plot_2d_crossplot",
-        "description": "Generates an interactive 2D crossplot (e.g. RHOB vs NPHI lithology plot colored by GR) with matrix trendlines.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "x_curve": {"type": "STRING", "description": "Mnemonic for X-axis curve (e.g. 'NEUT', 'NPHI')"},
-                "y_curve": {"type": "STRING", "description": "Mnemonic for Y-axis curve (e.g. 'DENB', 'RHOB')"},
-                "z_curve": {"type": "STRING", "description": "Optional mnemonic for color dimension (e.g. 'GR')"},
-                "top_depth": {"type": "NUMBER", "description": "Optional top depth boundary"},
-                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary"}
-            },
-            "required": ["well_id", "x_curve", "y_curve"]
-        }
-    },
-    {
-        "name": "compute_net_pay",
-        "description": "Calculates volumetric thicknesses: Gross Interval, Net Reservoir, Net Pay, and Net-to-Gross (NTG) ratio using Vshale, Porosity, and Sw cutoffs.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"},
-                "vsh_cutoff": {"type": "NUMBER", "description": "Shale volume cutoff (default 0.3)"},
-                "phi_cutoff": {"type": "NUMBER", "description": "Porosity cutoff (default 0.1)"},
-                "sw_cutoff": {"type": "NUMBER", "description": "Water saturation cutoff (default 0.5)"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "compare_vshale_methods",
-        "description": "Compares 4 shale volume calculation methods (Linear, Larionov Tertiary, Steiber, Clavier) across a depth interval and returns an interactive Plotly comparison curve.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "calculate_archie_saturation",
-        "description": "Computes continuous Archie water saturation (Sw), hydrocarbon saturation (So), and Bulk Volume Hydrocarbon (BVH) with interactive multi-track Plotly visualizer.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"},
-                "rw": {"type": "NUMBER", "description": "Formation water resistivity (default 0.05 ohm.m)"},
-                "m": {"type": "NUMBER", "description": "Cementation exponent (default 2.0)"},
-                "n": {"type": "NUMBER", "description": "Saturation exponent (default 2.0)"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "compute_sonic_porosity_wyllie",
-        "description": "Calculates Wyllie time-average sonic porosity from compressional sonic logs (DTCOMP) and compares it against density porosity.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"},
-                "dt_matrix": {"type": "NUMBER", "description": "Matrix transit time in us/ft (default 55.5 for Sandstone)"},
-                "dt_fluid": {"type": "NUMBER", "description": "Fluid transit time in us/ft (default 189.0 for water)"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "scan_reservoir_sweetspots",
-        "description": "Scans the entire well depth array to delineate, rank, and summarize all prospective hydrocarbon sweet spots meeting volumetric cutoffs.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "min_thickness": {"type": "NUMBER", "description": "Minimum continuous pay thickness in meters (default 1.5m)"}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "compute_permeability_timur_coates",
-        "description": "Calculates continuous reservoir permeability (k in mD) and flow capacity (k*h in mD*m) using Timur or Coates empirical models with interactive Plotly track.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"},
-                "model": {"type": "STRING", "description": "Permeability model ('timur' or 'coates', default 'timur')"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "plot_crossplot_picket",
-        "description": "Generates a classic Archie Picket Plot (log(Rt) vs log(Phi)) with 100% water line and iso-saturation trendlines.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Optional top depth boundary"},
-                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary"},
-                "rw": {"type": "NUMBER", "description": "Formation water resistivity (default 0.05)"},
-                "m": {"type": "NUMBER", "description": "Cementation exponent (default 2.0)"},
-                "n": {"type": "NUMBER", "description": "Saturation exponent (default 2.0)"}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "generate_reservoir_composite_report",
-        "description": "Generates an all-in-one zonal petrophysical dossier combining cutoffs, porosity, Archie saturations, flow capacity (k*h), and fluid typing.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Top depth in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Bottom depth in meters"}
-            },
-            "required": ["well_id", "top_depth", "bottom_depth"]
-        }
-    },
-    {
-        "name": "plot_3d_petrophysical_cube",
-        "description": "Exploratory 3D crossplot of neutron (X), density (Y, reversed) and sonic (Z) with approximate sandstone/limestone/dolomite trend lines. Points are colored either with the same pay rules as net pay (pay / wet reservoir / non-reservoir) or by depth. Needs neutron, density and sonic curves.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Optional top depth boundary in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary in meters"},
-                "color_by": {"type": "STRING", "description": "'pay' (default) or 'depth'"}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "plot_3d_wellbore_trajectory",
-        "description": "Interactive 3D wellbore view colored by computed pay flags along the hole. The XY path is illustrative (no deviation survey in the data); depth is TVDSS when available, otherwise MD.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
-                "top_depth": {"type": "NUMBER", "description": "Optional top depth boundary"},
-                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary"}
-            },
-            "required": ["well_id"]
-        }
-    },
-    {
-        "name": "query_geology_metadata",
-        "description": "Queries the local stratigraphy and mudlog catalog for geological formations, tops, and hydrocarbon show descriptions.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "query": {"type": "STRING", "description": "Search query keywords"},
-                "well_name": {"type": "STRING", "description": "Optional well id filter (e.g. 'Well1')"}
-            },
-            "required": ["query"]
-        }
-    }
-]
+_GEMINI_TYPES = {"string": "STRING", "number": "NUMBER", "integer": "INTEGER",
+                 "boolean": "BOOLEAN", "array": "ARRAY", "object": "OBJECT"}
+
+
+def _to_gemini_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an MCP tool's JSON Schema to Gemini's OpenAPI-style subset:
+    upper-case types, Optional[X] (anyOf X|null) -> nullable X, defaults moved
+    into the description (Gemini's schema has no default field), titles dropped."""
+    out: Dict[str, Any] = {}
+    options = schema.get("anyOf")
+    if options:
+        non_null = [o for o in options if o.get("type") != "null"]
+        if non_null:
+            out.update(_to_gemini_schema(non_null[0]))
+        if len(non_null) < len(options):
+            out["nullable"] = True
+    if schema.get("type") in _GEMINI_TYPES:
+        out["type"] = _GEMINI_TYPES[schema["type"]]
+    description = schema.get("description", out.get("description", ""))
+    if "default" in schema and schema["default"] is not None:
+        description = f"{description} (default {schema['default']})".strip()
+    if description:
+        out["description"] = description
+    if "enum" in schema:
+        out["enum"] = [str(v) for v in schema["enum"]]
+    if schema.get("type") == "object":
+        out["properties"] = {k: _to_gemini_schema(v) for k, v in schema.get("properties", {}).items()}
+        if schema.get("required"):
+            out["required"] = list(schema["required"])
+    if schema.get("type") == "array" and "items" in schema:
+        out["items"] = _to_gemini_schema(schema["items"])
+    return out
+
+
+def gemini_function_declarations() -> List[Dict[str, Any]]:
+    """The MCP server's tools, as Gemini function declarations."""
+    return [{"name": t.name, "description": t.description or "", "parameters": _to_gemini_schema(t.input_schema)}
+            for t in mcp_client.list_tools()]
+
 
 SYSTEM_PROMPT = """You are a petrophysics assistant for well log (LAS) data. You answer by calling tools and reporting what they return.
 The wells currently loaded (the user can drop in new LAS files at any time) are listed at the end of these instructions; use their exact ids as well_id.
@@ -247,148 +76,6 @@ Rules:
    - Use short sections or a small table only when they help. No marketing language.
    - Do not add "what to look at" or "what to ask next" sections: the app shows its own, built from the tool results.
 """
-
-
-def execute_tool(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str]]:
-    """Executes the requested tool and returns (result_dict, figure_json_or_None)."""
-    fig_json = None
-    try:
-        if name == "get_well_curves_summary":
-            res = get_well_curves_summary(args["well_id"])
-            return res, None
-            
-        elif name == "plot_1d_well_log":
-            res = plot_1d_well_log(
-                well_id=args["well_id"],
-                top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth"),
-                marker_depth=args.get("marker_depth")
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-            
-        elif name == "plot_2d_crossplot":
-            res = plot_2d_crossplot(
-                well_id=args["well_id"],
-                x_curve=args["x_curve"],
-                y_curve=args["y_curve"],
-                z_curve=args.get("z_curve"),
-                top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth")
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-            
-        elif name == "compute_net_pay":
-            res = compute_net_pay(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"]),
-                vsh_cutoff=float(args.get("vsh_cutoff", 0.3)),
-                phi_cutoff=float(args.get("phi_cutoff", 0.1)),
-                sw_cutoff=float(args.get("sw_cutoff", 0.5))
-            )
-            return res, None
-
-        elif name == "compare_vshale_methods":
-            res = compare_vshale_methods(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"])
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "calculate_archie_saturation":
-            res = calculate_archie_saturation(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"]),
-                rw=float(args.get("rw", 0.05)),
-                m=float(args.get("m", 2.0)),
-                n=float(args.get("n", 2.0))
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "compute_sonic_porosity_wyllie":
-            res = compute_sonic_porosity_wyllie(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"]),
-                dt_matrix=float(args.get("dt_matrix", 55.5)),
-                dt_fluid=float(args.get("dt_fluid", 189.0))
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "scan_reservoir_sweetspots":
-            res = scan_reservoir_sweetspots(
-                well_id=args["well_id"],
-                min_thickness=float(args.get("min_thickness", 1.5))
-            )
-            return res, None
-            
-        elif name == "compute_permeability_timur_coates":
-            res = compute_permeability_timur_coates(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"]),
-                model=args.get("model", "timur")
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "plot_crossplot_picket":
-            res = plot_crossplot_picket(
-                well_id=args["well_id"],
-                top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth"),
-                rw=float(args.get("rw", 0.05)),
-                m=float(args.get("m", 2.0)),
-                n=float(args.get("n", 2.0))
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "generate_reservoir_composite_report":
-            res = generate_reservoir_composite_report(
-                well_id=args["well_id"],
-                top_depth=float(args["top_depth"]),
-                bottom_depth=float(args["bottom_depth"])
-            )
-            return res, None
-
-        elif name == "plot_3d_petrophysical_cube":
-            res = plot_3d_petrophysical_cube(
-                well_id=args["well_id"],
-                top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth"),
-                color_by=args.get("color_by", "pay")
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "plot_3d_wellbore_trajectory":
-            res = plot_3d_wellbore_trajectory(
-                well_id=args["well_id"],
-                top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth")
-            )
-            fig_json = res.get("figure_json")
-            return {k: v for k, v in res.items() if k != "figure_json"}, fig_json
-
-        elif name == "query_geology_metadata":
-            results = query_catalog(
-                query_text=args["query"],
-                well_name=args.get("well_name")
-            )
-            return {"query": args["query"], "results": results}, None
-            
-        else:
-            return {"error": f"Unknown tool: {name}"}, None
-    except Exception as e:
-        return {"error": str(e)}, None
 
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
@@ -429,13 +116,14 @@ def run_agent_turn(
     chat_history: Optional[List[Dict[str, str]]] = None,
     active_well: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Runs one chat turn: Gemini picks tools, the engine computes, Gemini summarizes."""
+    """Runs one chat turn: Gemini picks tools, the MCP server runs them, Gemini summarizes."""
     if not GEMINI_API_KEY:
         return _generate_offline_summary(query, [], [], active_well)
 
     models_to_try = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"]))
     system_text = (SYSTEM_PROMPT + "\nLoaded wells:\n" + _wells_context()
                    + f"\nActive well selected in the UI: {active_well or 'none'}\n")
+    declarations = gemini_function_declarations()  # discovered from the MCP server
 
     contents = []
     if chat_history:
@@ -464,7 +152,7 @@ def run_agent_turn(
             resp_json = _post_gemini(model_name, {
                 "system_instruction": {"parts": [{"text": system_text}]},
                 "contents": current_contents,
-                "tools": [{"function_declarations": TOOLS_DEFINITIONS}],
+                "tools": [{"function_declarations": declarations}],
                 "generation_config": {"temperature": 0.2}
             }, timeout)
             if resp_json is None:
@@ -479,10 +167,11 @@ def run_agent_turn(
                 for fc in function_calls:
                     fn_name = fc["name"]
                     fn_args = fc.get("args", {})
-                    tool_result, fig_json = execute_tool(fn_name, fn_args)
+                    tool_result, fig_json = mcp_client.call_tool(fn_name, fn_args)
                     if fig_json:
                         generated_figures.append(fig_json)
-                    executed_tools_info.append({"name": fn_name, "args": fn_args, "result": tool_result})
+                    executed_tools_info.append({"name": fn_name, "args": fn_args, "result": tool_result,
+                                                "via": f"MCP ({mcp_client.transport()})"})
                     tool_resps.append({"functionResponse": {"name": fn_name, "response": {"result": tool_result}}})
                 current_contents.append({"role": "user", "parts": tool_resps})
                 continue
@@ -557,8 +246,9 @@ def _generate_offline_summary(
     q = query.lower()
 
     def run(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[str]]:
-        result, fig = execute_tool(name, args)
-        executed_tools.append({"name": name, "args": args, "result": result})
+        result, fig = mcp_client.call_tool(name, args)
+        executed_tools.append({"name": name, "args": args, "result": result,
+                               "via": f"MCP ({mcp_client.transport()})"})
         return result, fig
 
     note = ("_Offline summary: the language model is unavailable, so this is a fixed-format report "

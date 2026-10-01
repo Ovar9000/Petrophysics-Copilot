@@ -46,6 +46,7 @@ export interface ToolCallItem {
   name: string;
   args: Record<string, any>;
   result?: any;
+  via?: string; // e.g. "MCP (stdio)": how the backend executed the tool
 }
 
 export interface MessageItem {

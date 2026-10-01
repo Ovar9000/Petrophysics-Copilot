@@ -10,12 +10,22 @@ import lasio
 from backend.config import DATA_DIR
 
 _CATALOG_CACHE: List[Dict[str, Any]] = []
+_CATALOG_SIGNATURE: tuple = ()
+
+
+def _data_signature() -> tuple:
+    """Names + modification times of the files the catalog is built from. The
+    MCP server runs in its own process, so it cannot be told about an upload;
+    comparing this signature lets each process notice changes itself."""
+    files = list(DATA_DIR.glob("*.las")) + list(DATA_DIR.glob("*_geology_report.md"))
+    return tuple(sorted((p.name, p.stat().st_mtime) for p in files))
 
 
 def init_catalog() -> List[Dict[str, Any]]:
     """Loads well headers and markdown geology reports into memory."""
-    global _CATALOG_CACHE
+    global _CATALOG_CACHE, _CATALOG_SIGNATURE
     _CATALOG_CACHE = []
+    _CATALOG_SIGNATURE = _data_signature()
 
     # Every LAS in DATA_DIR (including uploads); a geology report is optional.
     wells = [
@@ -80,7 +90,7 @@ def _score_item(query_words: List[str], item: Dict[str, Any]) -> int:
 def query_catalog(query_text: str, well_name: Optional[str] = None) -> List[Dict[str, Any]]:
     """Instant keyword and relevance search across stratigraphy catalog."""
     global _CATALOG_CACHE
-    if not _CATALOG_CACHE:
+    if not _CATALOG_CACHE or _CATALOG_SIGNATURE != _data_signature():
         init_catalog()
 
     q_words = [w for w in query_text.lower().split() if len(w) > 2]

@@ -26,6 +26,9 @@ from backend.petrophysics import (
     plot_3d_petrophysical_cube,
     plot_3d_wellbore_trajectory,
 )
+import anyio
+
+from backend import mcp_client
 from backend.catalog import query_catalog, init_catalog
 from backend.agent import run_agent_turn
 from backend.suggestions import starter_guide, suggest_next
@@ -34,7 +37,11 @@ from backend.well_store import MAX_UPLOAD_BYTES, UploadError, WellExistsError, s
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_catalog()
+    # Launch the MCP server (stdio child process) that the chat agent's tool
+    # calls go through; falls back to in-process if it cannot start.
+    await anyio.to_thread.run_sync(mcp_client.start)
     yield
+    await anyio.to_thread.run_sync(mcp_client.stop)
 
 
 def _nan_to_none(obj: Any) -> Any:
@@ -192,6 +199,7 @@ def health_check():
     return {
         "status": "healthy",
         "engine": "pure_python_deterministic",
+        "chat_tools": f"MCP ({mcp_client.transport()})",
         "data_dir": str(DATA_DIR)
     }
 

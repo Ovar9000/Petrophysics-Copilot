@@ -46,14 +46,15 @@ flowchart TB
 
     subgraph Backend["FastAPI Petrophysical Engine (Port 8000)"]
         Router["FastAPI REST Endpoints\n(/api/chat, /api/tools/*)"]
-        Orchestrator["Agent Orchestrator\n(backend/agent.py)"]
+        Orchestrator["Agent + MCP client\n(backend/agent.py, backend/mcp_client.py)"]
         GeminiAPI["Google Gemini LLM\n(Function Calling Engine)"]
-        Engine["Deterministic Petrophysical Core\n(lasio, numpy, scipy, pandas)"]
+        MCPServer["MCP server: the tool registry\n(backend/mcp_server.py, stdio child process)"]
+        Engine["Deterministic Petrophysical Core\n(lasio, numpy, pandas)"]
         Catalog["Stratigraphy & Mudlog Catalog\n(backend/catalog.py)"]
     end
 
     subgraph External["External Clients / Extensions"]
-        ClaudeDesktop["Claude Desktop / Cursor\n(FastMCP Server @ backend/mcp_server.py)"]
+        ClaudeDesktop["Claude Desktop / Cursor\n(other MCP clients)"]
     end
 
     UI_Tree -->|Switch Active Well| UI_Deck
@@ -62,9 +63,11 @@ flowchart TB
     UI_Deck <-->|Direct Tool Calls| Router
     Router --> Orchestrator
     Orchestrator <-->|Multi-turn Tool Loop| GeminiAPI
-    Orchestrator --> Engine
-    Orchestrator --> Catalog
-    ClaudeDesktop <-->|STDIO MCP Protocol| Engine
+    Orchestrator <-->|MCP list_tools / call_tool over stdio| MCPServer
+    MCPServer --> Engine
+    MCPServer --> Catalog
+    ClaudeDesktop <-->|MCP over stdio| MCPServer
+    Router -->|/api/tools/*: UI views, no LLM| Engine
 ```
 
 ---
@@ -81,20 +84,24 @@ sequenceDiagram
     participant API as FastAPI Router (main.py)
     participant Agent as Agent Orchestrator (agent.py)
     participant Gemini as Google Gemini LLM
+    participant MCP as MCP Server (mcp_server.py)
     participant Core as Petrophysical Engine (petrophysics.py)
     participant LAS as .LAS Well Data Store
 
     User->>UI: "What is the net pay and average porosity between 1850m and 1920m?"
     UI->>API: POST /api/chat (message, well_id='Well1')
     API->>Agent: run_agent_turn(query, history, well_id)
-    Agent->>Gemini: Prompt + System Persona + TOOLS_DEFINITIONS
+    Note over Agent,MCP: At startup: list_tools, tool schemas converted to Gemini function declarations
+    Agent->>Gemini: Prompt + loaded wells + function declarations (from MCP)
     Gemini-->>Agent: Function Call: compute_net_pay(well_id='Well1', top_depth=1850, bottom_depth=1920)
-    Agent->>Core: compute_net_pay('Well1', 1850, 1920)
+    Agent->>MCP: call_tool("compute_net_pay", {...}) over stdio
+    MCP->>Core: compute_net_pay('Well1', 1850, 1920)
     Core->>LAS: Slices DataFrame (1850m <= DEPTH <= 1920m)
     Core-->>Core: Vectorized cutoffs (Vsh < 0.30, Phi > 0.10, Sw < 0.50)
-    Core-->>Agent: Returns JSON: {gross: 70m, net_pay: 22.4m, ntg: 0.32, avg_phi: 0.184, ...}
+    Core-->>MCP: Result dict (plots stored as figure:// resources)
+    MCP-->>Agent: Tool result JSON (numbers only)
     Agent->>Gemini: Function Result JSON
-    Gemini-->>Agent: Final Response with executive markdown, LaTeX, and geological insight
+    Gemini-->>Agent: Final answer written from the tool results
     Agent-->>API: Synthesized Response + Tool Execution Audit Badge
     API-->>UI: Chat response + figures (auto-selects Plotly deck tab)
     UI-->>User: Visual KPI Cards + Multi-track Curve View
@@ -102,10 +109,11 @@ sequenceDiagram
 
 ### 1. The Core Modules
 - **`backend/main.py`**: High-throughput FastAPI application exposing REST endpoints for chat sessions, individual petrophysical calculations, and dynamic Plotly figure generation.
-- **`backend/agent.py`**: The agent runtime. Maintains conversational state, formats petrophysical system prompts, sends strict OpenAPI tool schemas to Gemini, dispatches tool executions, and handles multi-turn loops until final synthesis is reached.
+- **`backend/agent.py`**: The agent loop. Builds the prompt, converts the MCP server's tool schemas into Gemini function declarations, sends each Gemini function call to the MCP server, and loops until Gemini writes the answer.
+- **`backend/mcp_client.py`**: The app's MCP client. Launches the MCP server as a stdio child process at startup and keeps one session open; falls back to calling the same server object in-process if the child process cannot start.
 - **`backend/petrophysics.py`**: Pure, deterministic subsurface math engine. Uses `lasio` for high-fidelity LAS reading, standardizes mnemonic curve names (e.g. `CNC`, `NPHI` -> Neutron; `RHOB`, `DENB` -> Bulk Density), executes vector math via `numpy`/`scipy`, and builds responsive multi-track Plotly figures.
 - **`backend/catalog.py`**: Stratigraphy and mudlog catalog. Loads the two geology reports into memory and ranks them by keyword matches (lexical retrieval, no vector store).
-- **`backend/mcp_server.py`**: Model Context Protocol (MCP) implementation exposing all petrophysical routines to Claude Desktop, Cursor, or any MCP-compliant sidecar.
+- **`backend/mcp_server.py`**: The single tool registry. Declares all 14 tools (names, descriptions, typed parameters) once; the web app's Gemini agent and desktop MCP clients (Claude Desktop, Cursor) both use it. Plots are exposed as `figure://` resources rather than inlined in tool results.
 
 ---
 
@@ -393,7 +401,10 @@ Open your browser:
 
 ## MCP (Model Context Protocol) Integration
 
-The platform includes a native **MCP Server** (`backend/mcp_server.py`) that exposes the entire deterministic petrophysical engine to external LLM clients such as **Claude Desktop**, **Cursor**, or **AI Sidecars**.
+`backend/mcp_server.py` is the one place the tools are defined. Two kinds of client use it:
+
+- **The web app's Gemini agent.** On startup the API launches the server as a stdio child process (`backend/mcp_client.py`). The agent lists its tools, converts their JSON Schemas into Gemini function declarations, and executes every Gemini function call as an MCP `call_tool`. Plots come back as `figure://` resources that the agent reads for the UI. `GET /health` reports `"chat_tools": "MCP (stdio)"`, and each tool badge in the chat shows "via MCP (stdio)".
+- **Desktop MCP clients** such as Claude Desktop or Cursor, configured as below. They see the same tools, descriptions and results.
 
 ### Claude Desktop Configuration
 Add the following snippet to your `claude_desktop_config.json`:
@@ -414,7 +425,7 @@ Add the following snippet to your `claude_desktop_config.json`:
 }
 ```
 
-Once configured, Claude can autonomously execute petrophysical calculations, slice intervals, and evaluate net pay directly in conversational workflows.
+Once configured, Claude can call the same tools as the web app's Gemini agent, with identical results.
 
 ---
 
@@ -433,7 +444,8 @@ well_log_rag_analytics/
 │   ├── catalog.py              # Geological stratigraphy & mudlog metadata catalog
 │   ├── config.py               # Central environment and path loader
 │   ├── main.py                 # FastAPI REST API endpoints & CORS middleware
-│   ├── mcp_server.py           # Model Context Protocol server for AI clients
+│   ├── mcp_client.py           # MCP client used by the agent (stdio session)
+│   ├── mcp_server.py           # MCP server: the single tool registry
 │   └── petrophysics.py         # Deterministic subsurface math & Plotly figure generator
 │
 ├── data/                       # Subsurface data store

@@ -206,6 +206,11 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
             <span className="font-mono text-zinc-700 font-medium">
               {tool.name}
             </span>
+            {tool.via && (
+              <span className="px-1.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-100 text-[10px] font-mono shrink-0">
+                via {tool.via}
+              </span>
+            )}
             <span className="text-[11px] text-zinc-400 font-mono truncate max-w-[280px]">
               {JSON.stringify(tool.args)}
             </span>

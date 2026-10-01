@@ -279,9 +279,9 @@ def test_default_window_is_centered_on_best_sweet_spot():
 
 
 def test_guide_after_1d_log_points_at_real_pay():
-    from backend.agent import execute_tool
+    from backend.mcp_client import call_tool
     from backend.suggestions import suggest_next
-    result, _ = execute_tool("plot_1d_well_log", {"well_id": "Well1", "top_depth": 1860, "bottom_depth": 1960})
+    result, _ = call_tool("plot_1d_well_log", {"well_id": "Well1", "top_depth": 1860, "bottom_depth": 1960})
     guide = suggest_next([{"name": "plot_1d_well_log", "args": {}, "result": result}], "Well1")
     zone = scan_reservoir_sweetspots("Well1")["sweetspots"][0]
     assert any(f"{zone['top_depth']:.0f}" in o for o in guide["observe"])
@@ -342,6 +342,64 @@ def test_3d_cube_refuses_missing_sonic_instead_of_inventing_it():
             plot_3d_petrophysical_cube("Test_NoSonic")
     finally:
         path.unlink(missing_ok=True)
+
+
+# --- MCP integration: the agent's tools come from, and run on, the MCP server ---
+
+def test_gemini_declarations_are_generated_from_mcp_tools():
+    import asyncio
+    from backend.mcp_server import mcp
+    from backend.agent import gemini_function_declarations
+    mcp_names = sorted(t.name for t in asyncio.run(mcp.list_tools()))
+    decls = {d["name"]: d for d in gemini_function_declarations()}
+    assert sorted(decls) == mcp_names and len(mcp_names) == 14
+    params = decls["plot_1d_well_log"]["parameters"]
+    assert params["type"] == "OBJECT" and params["required"] == ["well_id"]
+    assert params["properties"]["top_depth"] == {
+        "type": "NUMBER", "nullable": True,
+        "description": "Optional top depth in meters (MD); omit for the whole log"}
+    assert "(default 0.3)" in decls["compute_net_pay"]["parameters"]["properties"]["vsh_cutoff"]["description"]
+
+
+def test_agent_turn_executes_gemini_function_calls_through_mcp(monkeypatch):
+    """Scripted Gemini replies (no network): call a plot tool, then answer."""
+    from backend import agent
+    replies = iter([
+        {"candidates": [{"content": {"role": "model", "parts": [{"functionCall": {
+            "name": "plot_1d_well_log", "args": {"well_id": "Well1", "top_depth": 1860, "bottom_depth": 1960}}}]}}]},
+        {"candidates": [{"content": {"role": "model", "parts": [{"text": "Here is the log."}]}}]},
+    ])
+    sent = []
+    monkeypatch.setattr(agent, "GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(agent, "_post_gemini", lambda model, payload, timeout: (sent.append(payload), next(replies))[1])
+
+    out = agent.run_agent_turn("Show the 1D log for Well1", [], "Well1")
+    assert out["text"] == "Here is the log."
+    call = out["tool_calls"][0]
+    assert call["name"] == "plot_1d_well_log" and call["via"].startswith("MCP")
+    assert "figure_uri" not in call["result"] and len(out["figures"]) == 1
+    # Gemini was offered the MCP tool list, and got the result back without the figure
+    assert len(sent[0]["tools"][0]["function_declarations"]) == 14
+    returned = sent[1]["contents"][-1]["parts"][0]["functionResponse"]["response"]["result"]
+    assert returned["well_id"] == "Well1" and "figure_json" not in returned
+
+
+def test_mcp_server_end_to_end_over_stdio():
+    """The real protocol: spawn the server, list tools, call one, read a figure."""
+    from backend.mcp_client import StdioConnection
+    conn = StdioConnection()
+    conn.start()
+    try:
+        assert len(conn.tools) == 14
+        res = conn.call_tool("compute_net_pay", {"well_id": "Well1", "top_depth": 1906, "bottom_depth": 1915})
+        assert not res.is_error and json.loads(res.content[0].text)["net_pay_m"] > 0
+        plot = json.loads(conn.call_tool("plot_1d_well_log", {"well_id": "Well2"}).content[0].text)
+        fig = json.loads(conn.read_resource(plot["figure_uri"]).contents[0].text)
+        assert fig["layout"]["meta"]["plot_kind"] == "1d"
+        bad = conn.call_tool("compute_net_pay", {"well_id": "Nope", "top_depth": 1, "bottom_depth": 2})
+        assert bad.is_error and "not found" in bad.content[0].text
+    finally:
+        conn.stop()
 
 
 if __name__ == "__main__":
