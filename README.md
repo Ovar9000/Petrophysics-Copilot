@@ -27,7 +27,7 @@ The platform is purpose-built to deliver **real-time visualization, retrieval, a
 
 | Pillar | Technical Mechanism | Subsurface Realization |
 | :--- | :--- | :--- |
-| **Real-Time Visualization** | High-performance Plotly.js + React 19 deck | • **1D Multi-Track Logs**: 3 synchronized tracks (GR/Caliper with washout & mudcake fills, log Resistivity, Density-Neutron crossover, synchronized spikeline depth correlation).<br>• **2D Lithology Crossplots**: Inverted RHOB vs NPHI with Quartz/Calcite/Dolomite calibration lines and Gas Correction Vector.<br>• **3D Cluster Space**: Snug petrophysical cube with mineral matrix sheet, floor/wall shadow projections, and 50%/80% density hulls.<br>• **3D Wellbore View**: Depth-true wellbore colored by computed pay flags; the XY path and top-pay surface are illustrative (the LAS files contain no deviation survey or mapped tops). |
+| **Real-Time Visualization** | High-performance Plotly.js + React 19 deck | • **1D Multi-Track Logs**: 3 synchronized tracks (GR/Caliper with washout & mudcake fills, log Resistivity, Density-Neutron crossover, synchronized spikeline depth correlation).<br>• **2D Lithology Crossplots**: Inverted RHOB vs NPHI with Quartz/Calcite/Dolomite calibration lines and Gas Correction Vector.<br>• **3D Crossplot**: Neutron × density × sonic with the three 2D crossplots projected on the walls; points colored by the same pay rules as net pay (exploratory view).<br>• **3D Wellbore View**: Depth-true wellbore colored by computed pay flags; the XY path and top-pay surface are illustrative (the LAS files contain no deviation survey or mapped tops). |
 | **Subsurface Retrieval** | Stratigraphy Catalog + Dynamic LAS depth slicing | • **Tabular Log Retrieval**: Slicing raw `.las` curve arrays on-demand based on requested depth boundaries.<br>• **Geological Report Retrieval**: Catalog lookup for formation tops, stratigraphy summaries, and mudlog hydrocarbon show notes directly from well geology reports. |
 | **Parameter Computation** | Vectorized deterministic Python engine | • **Volumetric Net Pay**: Gross interval, Net Reservoir, Net Pay, and Net-to-Gross ($NTG$).<br>• **Fluid Saturations**: Archie water saturation ($S_w$), hydrocarbon saturation ($S_o$), Bulk Volume Hydrocarbons ($BVH$).<br>• **Permeability & Flow**: Timur and Coates continuous permeability ($k$) and flow capacity ($k \cdot h$).<br>• **Porosity & Shale**: Wyllie time-average sonic porosity and multi-model $V_{\text{sh}}$ comparison (Linear, Larionov, Steiber, Clavier). |
 | **Based on User Requests** | Autonomous Agentic Function Calling | • Plain English queries (e.g., *"Evaluate reservoir net pay and crossplot Well 2 between 3650m and 3750m"*) trigger parameter extraction, deterministic tool execution, visual tab synchronization, and a short written summary grounded in the tool results. |
@@ -183,13 +183,13 @@ Applies strict volumetric cutoff criteria across depth arrays:
 </details>
 
 <details>
-<summary><b>4. <code>plot_3d_petrophysical_cube</code> — 3D Cluster Space & Mineral Matrix Sheet</b></summary>
+<summary><b>4. <code>plot_3d_petrophysical_cube</code> — Exploratory 3D Crossplot</b></summary>
 
 Builds an advanced 3D petrophysical inspection space:
 - **X-Axis**: Neutron Porosity ($\text{NPHI}$, $\text{v/v}$)
 - **Y-Axis**: Bulk Density ($\text{RHOB}$, $\text{g/cm}^3$, reversed)
 - **Z-Axis**: Compressional Slowness ($\text{DT}$, $\mu\text{s/ft}$)
-- Features 3D Mineral Matrix surfaces (Quartz, Calcite, Dolomite sheet), projected 2D floor/wall shadow contours, volumetric 50% core and 80% containment isosurface envelopes, and toggleable discrete lithofacies (Clean Gas Pay, Clean Water Sand, Shaly Sand, Shale/Clay, Tight Carbonate).
+- Projects the three classic 2D crossplots onto the floor and walls, draws approximate quartz/calcite/dolomite trend lines, and colors samples with the same pay rules as net pay (pay / wet reservoir / non-reservoir). Requires real neutron, density and sonic curves; missing curves are reported, never filled with assumed values.
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -199,9 +199,9 @@ Builds an advanced 3D petrophysical inspection space:
 </details>
 
 <details>
-<summary><b>5. <code>plot_3d_wellbore_trajectory</code> — True 3D Spatial Wellbore & Pay Horizon</b></summary>
+<summary><b>5. <code>plot_3d_wellbore_trajectory</code> — 3D Wellbore View (illustrative path)</b></summary>
 
-Renders a 3D wellbore view colored by computed hydrocarbon pay flags (TVDSS when the LAS has it, otherwise MD). The XY path and the top-pay surface are **illustrative**: the data has no deviation survey, so no minimum-curvature trajectory is computed, and the surface is not a mapped horizon.
+Renders a 3D wellbore view colored by computed hydrocarbon pay flags (TVDSS when the LAS has it, otherwise MD). The XY path is **illustrative**: the data has no deviation survey, so no minimum-curvature trajectory is computed.
 
 | Parameter | Type | Required | Default | Description |
 | :--- | :--- | :--- | :--- | :--- |
@@ -329,7 +329,7 @@ To maintain engineering integrity, users should note the following physical and 
 <summary><b>2. Log Data Availability & Graceful Fallbacks</b></summary>
 
 - **Missing Caliper**: If a physical caliper curve (`CALI`) is missing from the LAS file, Track 1 defaults to an estimated bit size gauge baseline ($8.5''$ or $12.25''$) based on depth.
-- **Missing Sonic**: 3D cluster cube plotting requires compressional sonic (`DTCOMP` / `DT`). If missing, standard regional defaults ($85\,\mu\text{s/ft}$) are substituted.
+- **Missing Sonic**: The 3D crossplot requires neutron, density and compressional sonic (`DTCOMP` / `DT`). If one is missing, the tool reports which curve is absent instead of substituting a default value.
 - **Bed Resolution**: Standard induction resistivity logs have vertical resolution limitations (~1.5–2.0m). Pay zones thinner than 0.5m may experience bed-boundary averaging (shoulder bed effects).
 </details>
 

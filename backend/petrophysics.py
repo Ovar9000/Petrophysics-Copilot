@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from scipy.spatial import ConvexHull
 
 from backend.config import DATA_DIR
 
@@ -1514,18 +1513,22 @@ def generate_reservoir_composite_report(
 def plot_3d_petrophysical_cube(
     well_id: str,
     top_depth: Optional[float] = None,
-    bottom_depth: Optional[float] = None
+    bottom_depth: Optional[float] = None,
+    color_by: str = "pay",
 ) -> Dict[str, Any]:
-    """Generates an advanced 3D Petrophysical Cluster Space:
-    - X-axis: Neutron Porosity (NPHI/NEUT, v/v)
-    - Y-axis: Bulk Density (RHOB/DENB, g/cc, reversed)
-    - Z-axis: Compressional Slowness (DT/DTCOMP, µs/ft)
-    - 3D Mineral Matrix Surfaces (Rhomb/Triangle planes & trend lines)
-    - Projected 2D "Shadow" contours/scatter on Floor and Walls
-    - Isosurface Envelopes (Volumetric density shells: 50% core hull & 80% containment shell)
-    - Discrete Lithofacies Traces (Toggleable in legend)
-    - Detailed Hover Readout (Depth, Lithology, Phie, DENB, NEUT, DT, GR, Rt)
+    """3D crossplot of the three porosity logs (exploratory view):
+    - X: neutron porosity, Y: bulk density (reversed), Z: compressional sonic
+    - Approximate sandstone/limestone/dolomite trend lines (Wyllie sonic mixing)
+    - color_by="pay": the SAME pay rules as net pay (pay / wet reservoir /
+      non-reservoir), so this view can never contradict the net pay numbers
+    - color_by="depth": a depth color scale, to see where each cluster sits
+    Kept deliberately sparse (no wall projections, orthographic camera) so dots
+    are not confused with projections. Requires real neutron, density and sonic
+    curves: missing curves are never replaced with assumed constants.
     """
+    color_by = (color_by or "pay").lower()
+    if color_by not in ("pay", "depth"):
+        raise ValueError("color_by must be 'pay' or 'depth'")
     las, df = read_las(well_id)
     cols = {c.upper(): c for c in df.columns}
     sub = df.copy()
@@ -1533,391 +1536,233 @@ def plot_3d_petrophysical_cube(
         sub = sub[sub["DEPTH"] >= top_depth]
     if bottom_depth is not None:
         sub = sub[sub["DEPTH"] <= bottom_depth]
-    
+
     depths = sub["DEPTH"].values
     if len(depths) == 0:
         raise ValueError("No data samples available in selected depth range.")
-        
+
     neut_col = cols.get("NEUT") or cols.get("NPHI") or cols.get("CNC")
     denb_col = cols.get("DENB") or cols.get("RHOB") or cols.get("RHOZ")
     dt_col = cols.get("DTCOMP") or cols.get("DT") or cols.get("DTC")
-    gr_col = cols.get("GR")
-    r_col = cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
-    phie_col = cols.get("PHIE")
-    
-    neut = sub[neut_col].values if neut_col else np.full(len(depths), 0.20)
-    denb = sub[denb_col].values if denb_col else np.full(len(depths), 2.45)
-    dt = sub[dt_col].values if dt_col else np.full(len(depths), 85.0)
-    gr = sub[gr_col].values if gr_col else np.full(len(depths), 65.0)
-    rt = sub[r_col].values if r_col else np.full(len(depths), 5.0)
-    rt = np.where(np.isnan(rt) | (rt <= 0), 5.0, rt)
-    
-    if phie_col:
-        phie = sub[phie_col].values
-    else:
-        phie = np.clip((2.65 - denb) / 1.65, 0.0, 0.45)
-        
-    valid = (~np.isnan(neut)) & (~np.isnan(denb)) & (~np.isnan(dt)) & (~np.isnan(gr)) & (denb > 1.2) & (denb < 3.2)
-    v_depths = depths[valid]
-    v_neut = neut[valid]
-    v_denb = denb[valid]
-    v_dt = dt[valid]
-    v_gr = gr[valid]
-    v_rt = rt[valid]
-    v_phie = phie[valid]
-    
-    if len(v_depths) == 0:
-        raise ValueError("No valid overlapping petrophysical samples in depth range.")
+    missing = [name for name, col in (("neutron", neut_col), ("density", denb_col), ("sonic", dt_col)) if not col]
+    if missing:
+        raise ValueError(f"The 3D crossplot needs neutron, density and sonic curves; "
+                         f"{well_id} has no {', '.join(missing)} curve.")
 
-    p05_x, p995_x = float(np.nanpercentile(v_neut, 0.5)), float(np.nanpercentile(v_neut, 99.5))
-    min_x = min(0.0, max(-0.02, p05_x - 0.02))
-    max_x = min(0.46, max(0.36, p995_x + 0.02))
+    # Pay classification from the shared recipe (same as net pay / sweet spots)
+    vsh, phi, sw, methods = derive_vsh_phi_sw(sub, cols, gr_bounds=_well_gr_bounds(df), **PAY_MODEL)
+    classified = ~np.isnan(vsh) & ~np.isnan(phi) & ~np.isnan(sw)
+    is_res = classified & (vsh <= VSH_CUTOFF) & (phi >= PHI_CUTOFF)
+    is_pay = is_res & (sw <= SW_CUTOFF)
 
-    p05_y, p995_y = float(np.nanpercentile(v_denb, 0.5)), float(np.nanpercentile(v_denb, 99.5))
-    min_y = max(2.05, p05_y - 0.04)
-    max_y = min(2.92, max(2.88, p995_y + 0.02))
+    neut = sub[neut_col].values
+    denb = sub[denb_col].values
+    dt = sub[dt_col].values
+    gr_col, r_col = cols.get("GR"), cols.get("RDEEP") or cols.get("ILD") or cols.get("RT")
+    gr = sub[gr_col].values if gr_col else np.full(len(depths), np.nan)
+    rt = sub[r_col].values if r_col else np.full(len(depths), np.nan)
 
-    p05_z, p99_z = float(np.nanpercentile(v_dt, 0.5)), float(np.nanpercentile(v_dt, 99.0))
-    min_z = min(43.0, max(40.0, p05_z - 3.0))
-    max_z = min(160.0, max(120.0, p99_z + 6.0))
+    valid = (~np.isnan(neut)) & (~np.isnan(denb)) & (~np.isnan(dt)) & (denb > 1.2) & (denb < 3.2)
+    if not np.any(valid):
+        raise ValueError("No depth samples have neutron, density and sonic values in this range.")
+    v_depths, v_neut, v_denb, v_dt = depths[valid], neut[valid], denb[valid], dt[valid]
+    v_gr, v_rt, v_phi, v_vsh, v_sw = gr[valid], rt[valid], phi[valid], vsh[valid], sw[valid]
+    v_class = np.where(is_pay[valid], "pay", np.where(is_res[valid], "wet",
+                       np.where(classified[valid], "non", "unclassified")))
 
-    floor_z = min_z - 1.5
-    back_y = max_y + 0.02
-    side_x = max_x + 0.015
+    # Axis ranges: the data, plus room for the mineral end points.
+    min_x = min(-0.02, float(np.nanpercentile(v_neut, 0.5)) - 0.02)
+    max_x = max(0.40, float(np.nanpercentile(v_neut, 99.5)) + 0.02)
+    min_z = min(40.0, float(np.nanpercentile(v_dt, 0.5)) - 3.0)
+    max_z = max(120.0, float(np.nanpercentile(v_dt, 99.0)) + 6.0)
 
-    fig = go.Figure()
+    # Left: the 3D crossplot (what the rock is). Right: a depth track with the
+    # same colors (where it is in the well), so a cluster can be traced to depth.
+    fig = make_subplots(
+        rows=1, cols=2, column_widths=[0.78, 0.22], horizontal_spacing=0.06,
+        specs=[[{"type": "scene"}, {"type": "xy"}]],
+        subplot_titles=["", "Depth track"],
+    )
 
-    # 1. Projected 2D "Shadow" Scatter on Floor and Walls (High Contrast)
-    fig.add_trace(go.Scatter3d(
-        x=v_neut,
-        y=v_denb,
-        z=np.full_like(v_neut, floor_z),
-        mode="markers",
-        marker=dict(size=3.0, color="rgba(30, 41, 59, 0.65)", symbol="circle"),
-        hoverinfo="none",
-        name="Floor: Density-Neutron Shadow",
-        legendgroup="shadows"
-    ))
-    fig.add_trace(go.Scatter3d(
-        x=v_neut,
-        y=np.full_like(v_neut, back_y),
-        z=v_dt,
-        mode="markers",
-        marker=dict(size=3.0, color="rgba(51, 65, 85, 0.60)", symbol="circle"),
-        hoverinfo="none",
-        name="Back: Neutron-Sonic Shadow",
-        legendgroup="shadows"
-    ))
-    fig.add_trace(go.Scatter3d(
-        x=np.full_like(v_denb, side_x),
-        y=v_denb,
-        z=v_dt,
-        mode="markers",
-        marker=dict(size=3.0, color="rgba(51, 65, 85, 0.60)", symbol="circle"),
-        hoverinfo="none",
-        name="Side: Density-Sonic Shadow",
-        legendgroup="shadows"
-    ))
-
-    # 2. 3D Mineral Matrix Surfaces & Trend Lines (Rhomb/Triangle Grid)
-    # Mineral matrix triangle at 0% porosity
-    fig.add_trace(go.Scatter3d(
-        x=[0.00, 0.00, 0.02, 0.00],
-        y=[2.65, 2.71, 2.87, 2.65],
-        z=[55.5, 47.5, 43.5, 55.5],
-        mode="lines+markers+text",
-        line=dict(color="#1E293B", width=3.5, dash="solid"),
-        marker=dict(size=4.5, color="#0F172A"),
-        text=["Quartz (2.65)", "Calcite (2.71)", "Dolomite (2.87)", ""],
-        textposition="top right",
-        textfont=dict(size=10, color="#1E293B"),
-        name="0% Porosity Mineral Triangle",
-        legendgroup="minerals"
-    ))
-
-    # Lithology Porosity Trends (0% to 35% porosity)
+    # 1. Approximate clean-rock trend lines, 0-35% porosity (Wyllie sonic mixing).
+    # Neutron is drawn as if it read true porosity in each matrix, so these are
+    # guides, not tool-specific chart lines. Labels sit at the 0% (mineral) end;
+    # porosity ticks are marked once, on the sandstone line.
     phi_grid = np.linspace(0.0, 0.35, 20)
-    
-    # Sandstone / Quartz line
-    fig.add_trace(go.Scatter3d(
-        x=phi_grid,
-        y=2.65 * (1 - phi_grid) + 1.0 * phi_grid,
-        z=55.5 * (1 - phi_grid) + 189.0 * phi_grid,
-        mode="lines",
-        line=dict(color="#EAB308", width=3),
-        name="Sandstone Calibration Line",
-        legendgroup="minerals"
-    ))
-    # Limestone / Calcite line
-    fig.add_trace(go.Scatter3d(
-        x=phi_grid,
-        y=2.71 * (1 - phi_grid) + 1.0 * phi_grid,
-        z=47.5 * (1 - phi_grid) + 189.0 * phi_grid,
-        mode="lines",
-        line=dict(color="#3B82F6", width=3),
-        name="Limestone Calibration Line",
-        legendgroup="minerals"
-    ))
-    # Dolomite line
-    fig.add_trace(go.Scatter3d(
-        x=0.02 + 0.98 * phi_grid,
-        y=2.87 * (1 - phi_grid) + 1.0 * phi_grid,
-        z=43.5 * (1 - phi_grid) + 189.0 * phi_grid,
-        mode="lines",
-        line=dict(color="#A855F7", width=3),
-        name="Dolomite Calibration Line",
-        legendgroup="minerals"
-    ))
-
-    # Iso-Porosity Rungs (10%, 20%, 30%)
-    for p_iso in [0.10, 0.20, 0.30]:
-        rung_x = [p_iso, p_iso, 0.02 + 0.98 * p_iso]
-        rung_y = [2.65 * (1 - p_iso) + 1.0 * p_iso, 2.71 * (1 - p_iso) + 1.0 * p_iso, 2.87 * (1 - p_iso) + 1.0 * p_iso]
-        rung_z = [55.5 * (1 - p_iso) + 189.0 * p_iso, 47.5 * (1 - p_iso) + 189.0 * p_iso, 43.5 * (1 - p_iso) + 189.0 * p_iso]
+    for label, x0, rho_ma, dt_ma, color in (
+        ("Sandstone", 0.00, 2.65, 55.5, MATRIX_COLORS["sandstone"]),
+        ("Limestone", 0.00, 2.71, 47.5, MATRIX_COLORS["limestone"]),
+        ("Dolomite", 0.02, 2.87, 43.5, MATRIX_COLORS["dolomite"]),
+    ):
         fig.add_trace(go.Scatter3d(
-            x=rung_x, y=rung_y, z=rung_z,
+            x=x0 + (1 - x0) * phi_grid,
+            y=rho_ma * (1 - phi_grid) + 1.0 * phi_grid,
+            z=dt_ma * (1 - phi_grid) + 189.0 * phi_grid,
             mode="lines+text",
-            line=dict(color="#94A3B8", width=1.8, dash="dash"),
-            text=["", f"Φ = {int(p_iso*100)}%", ""],
-            textposition="top center",
-            textfont=dict(size=9, color="#64748B"),
-            name=f"Iso-Porosity {int(p_iso*100)}% Rung",
-            legendgroup="minerals",
-            showlegend=(p_iso == 0.20)
+            line=dict(color=color, width=5),
+            text=[label] + [""] * (len(phi_grid) - 1),
+            textposition="bottom center",
+            textfont=dict(size=10, color=color),
+            hoverinfo="skip",
+            name=f"{label} trend (approx.)",
+            legendgroup="minerals"
         ))
-
-    # Mineral Matrix Calibration Surface (Mesh3D)
-    surf_pts = np.array([
-        [0.00, 2.65, 55.5],
-        [0.00, 2.71, 47.5],
-        [0.02, 2.87, 43.5],
-        [0.30, 2.65 * 0.7 + 0.3, 55.5 * 0.7 + 189 * 0.3],
-        [0.30, 2.71 * 0.7 + 0.3, 47.5 * 0.7 + 189 * 0.3],
-        [0.02 + 0.98 * 0.3, 2.87 * 0.7 + 0.3, 43.5 * 0.7 + 189 * 0.3]
-    ])
-    fig.add_trace(go.Mesh3d(
-        x=surf_pts[:, 0],
-        y=surf_pts[:, 1],
-        z=surf_pts[:, 2],
-        i=[0, 0, 0, 1, 1, 3],
-        j=[1, 3, 4, 4, 5, 4],
-        k=[2, 4, 1, 5, 2, 5],
-        color="#CBD5E1",
-        opacity=0.18,
-        name="Mineral Matrix Calibration Sheet",
-        legendgroup="minerals",
-        showlegend=True
+    ticks = np.array([0.10, 0.20, 0.30])
+    fig.add_trace(go.Scatter3d(
+        x=ticks, y=2.65 * (1 - ticks) + ticks, z=55.5 * (1 - ticks) + 189.0 * ticks,
+        mode="markers+text",
+        marker=dict(size=3, color=MATRIX_COLORS["sandstone"]),
+        text=[f"{int(t * 100)}%" for t in ticks],
+        textposition="middle right",
+        textfont=dict(size=9, color="#64748B"),
+        hoverinfo="skip", showlegend=False
     ))
 
-    # 3. Volumetric Density Shells / Isosurface Envelopes
-    norm_n = (v_neut - np.mean(v_neut)) / (np.std(v_neut) + 1e-6)
-    norm_b = (v_denb - np.mean(v_denb)) / (np.std(v_denb) + 1e-6)
-    norm_t = (v_dt - np.mean(v_dt)) / (np.std(v_dt) + 1e-6)
-    dist = np.sqrt(norm_n**2 + norm_b**2 + norm_t**2)
+    # 2. Samples
+    porosity_label = "Porosity (PHIE log)" if "PHIE" in cols else "Total porosity (density)"
+    class_labels = {
+        "pay": "Pay: clean, porous, Sw ≤ 50%",
+        "wet": "Wet reservoir: clean, porous, Sw > 50%",
+        "non": "Non-reservoir: shaly or tight",
+        "unclassified": "Not classified (missing log values)",
+    }
+    fmt = lambda v, f: "n/a" if np.isnan(v) else format(v, f)
 
-    # 50% core density hull
-    p50_mask = dist <= np.percentile(dist, 50)
-    if np.sum(p50_mask) >= 12:
-        try:
-            pts_50 = np.column_stack([v_neut[p50_mask], v_denb[p50_mask], v_dt[p50_mask]])
-            hull_50 = ConvexHull(pts_50)
-            fig.add_trace(go.Mesh3d(
-                x=pts_50[:, 0], y=pts_50[:, 1], z=pts_50[:, 2],
-                i=hull_50.simplices[:, 0], j=hull_50.simplices[:, 1], k=hull_50.simplices[:, 2],
-                color="#F59E0B",
-                opacity=0.22,
-                name="50% Core Density Hull",
-                lighting=dict(ambient=0.6, diffuse=0.8, roughness=0.5),
-                showlegend=True
-            ))
-        except Exception:
-            pass
-
-    # 80% regional containment shell
-    p80_mask = dist <= np.percentile(dist, 80)
-    if np.sum(p80_mask) >= 16:
-        try:
-            pts_80 = np.column_stack([v_neut[p80_mask], v_denb[p80_mask], v_dt[p80_mask]])
-            hull_80 = ConvexHull(pts_80)
-            fig.add_trace(go.Mesh3d(
-                x=pts_80[:, 0], y=pts_80[:, 1], z=pts_80[:, 2],
-                i=hull_80.simplices[:, 0], j=hull_80.simplices[:, 1], k=hull_80.simplices[:, 2],
-                color="#3B82F6",
-                opacity=0.08,
-                name="80% Regional Containment Shell",
-                lighting=dict(ambient=0.7, diffuse=0.6, roughness=0.6),
-                showlegend=True
-            ))
-        except Exception:
-            pass
-
-    # 4. Discrete Lithofacies Classification & Toggleable Traces
-    facies_labels = []
-    for d, n, b, t, g, r in zip(v_depths, v_neut, v_denb, v_dt, v_gr, v_rt):
-        if b >= 2.65 and n < 0.18:
-            facies_labels.append("Tight Carbonate")
-        elif g < 65 and b < 2.40 and r >= 8.0:
-            facies_labels.append("Clean Gas Pay")
-        elif g < 65 and b < 2.45:
-            facies_labels.append("Clean Water Sand")
-        elif g < 95 and b < 2.58:
-            facies_labels.append("Shaly Sand")
-        else:
-            facies_labels.append("Shale / Clay")
-    facies_arr = np.array(facies_labels)
-
-    facies_config = [
-        ("Clean Gas Pay", "#F59E0B"),       # Amber/Gold
-        ("Clean Water Sand", "#06B6D4"),     # Cyan/Teal
-        ("Shaly Sand", "#10B981"),          # Emerald Green
-        ("Shale / Clay", "#64748B"),        # Slate Gray
-        ("Tight Carbonate", "#3B82F6")      # Royal Blue
-    ]
-
-    for fname, fcolor in facies_config:
-        fmask = (facies_arr == fname)
-        count = int(np.sum(fmask))
-        if count == 0:
-            continue
-            
-        m_depth = v_depths[fmask]
-        m_neut = v_neut[fmask]
-        m_denb = v_denb[fmask]
-        m_dt = v_dt[fmask]
-        m_gr = v_gr[fmask]
-        m_rt = v_rt[fmask]
-        m_phie = v_phie[fmask]
-        
-        # Marker sizes dynamically weighted by log(Rt)
-        clean_rt = np.nan_to_num(m_rt, nan=5.0, posinf=50.0, neginf=0.1)
-        marker_sizes = np.clip(3.5 + 2.0 * np.log10(np.maximum(clean_rt, 0.1)), 3.5, 7.5)
-        
-        hover_texts = [
-            f"<b>{fname}</b><br>"
-            f"Depth (MD): <b>{d:.2f} m</b><br>"
-            f"Neutron Porosity (NPHI): <b>{n:.3f} v/v</b><br>"
-            f"Bulk Density (RHOB): <b>{b:.2f} g/cc</b><br>"
-            f"Sonic Slowness (DT): <b>{t:.1f} µs/ft</b><br>"
-            f"Gamma Ray (GR): <b>{g:.1f} API</b><br>"
-            f"Deep Resistivity (Rt): <b>{r:.2f} Ω·m</b><br>"
-            f"Effective Porosity (Φe): <b>{p*100:.1f}%</b>"
-            for d, n, b, t, g, r, p in zip(m_depth, m_neut, m_denb, m_dt, m_gr, m_rt, m_phie)
+    def hover(mask: np.ndarray) -> List[str]:
+        return [
+            f"<b>{class_labels[c]}</b><br>Depth (MD): <b>{d:.2f} m</b><br>"
+            f"Neutron: <b>{n:.3f} v/v</b> · Density: <b>{b:.2f} g/cc</b> · Sonic: <b>{t:.1f} µs/ft</b><br>"
+            f"GR: <b>{fmt(g, '.1f')} API</b> · Deep resistivity: <b>{fmt(r, '.2f')} Ω·m</b><br>"
+            f"Vsh: <b>{fmt(vs * 100, '.0f')}%</b> · {porosity_label}: <b>{fmt(p * 100, '.1f')}%</b> · "
+            f"Sw: <b>{fmt(s * 100, '.0f')}%</b>"
+            for c, d, n, b, t, g, r, vs, p, s in zip(
+                v_class[mask], v_depths[mask], v_neut[mask], v_denb[mask], v_dt[mask], v_gr[mask],
+                v_rt[mask], v_vsh[mask], v_phi[mask], v_sw[mask])
         ]
-        
-        fig.add_trace(go.Scatter3d(
-            x=m_neut,
-            y=m_denb,
-            z=m_dt,
-            mode="markers",
-            marker=dict(
-                size=marker_sizes,
-                color=fcolor,
-                opacity=0.88,
-                line=dict(color="#0F172A", width=0.5)
-            ),
-            text=hover_texts,
-            hoverinfo="text",
-            name=f"{fname} ({count} pts)",
-            legendgroup="facies"
-        ))
 
-    # 5. Visual Anchor: Gas Effect Drop-Lines / Leader Lines down to Sandstone Matrix
-    gas_mask = (facies_arr == "Clean Gas Pay")
-    if np.any(gas_mask):
-        g_neut = v_neut[gas_mask]
-        g_denb = v_denb[gas_mask]
-        g_dt = v_dt[gas_mask]
-        
-        # Subsample up to 50 prominent leader lines to keep canvas sharp & uncluttered
-        step = max(1, len(g_neut) // 50)
-        lead_x: List[Optional[float]] = []
-        lead_y: List[Optional[float]] = []
-        lead_z: List[Optional[float]] = []
-        for n, b, t in zip(g_neut[::step], g_denb[::step], g_dt[::step]):
-            phi_eq = float(np.clip((2.65 - b) / 1.65, 0.05, 0.35))
-            mat_x = phi_eq
-            mat_y = 2.65 * (1.0 - phi_eq) + 1.0 * phi_eq
-            mat_z = 55.5 * (1.0 - phi_eq) + 189.0 * phi_eq
-            lead_x.extend([float(n), mat_x, None])
-            lead_y.extend([float(b), mat_y, None])
-            lead_z.extend([float(t), mat_z, None])
-            
+    counts = {key: int(np.sum(v_class == key)) for key in class_labels}
+    if color_by == "depth":
+        everything = np.ones(len(v_depths), dtype=bool)
         fig.add_trace(go.Scatter3d(
-            x=lead_x,
-            y=lead_y,
-            z=lead_z,
-            mode="lines",
-            line=dict(color="#EF4444", width=1.5, dash="dot"),
-            opacity=0.60,
-            hoverinfo="none",
-            name="Gas Displacement Vectors",
-            legendgroup="facies"
+            x=v_neut, y=v_denb, z=v_dt, mode="markers",
+            # No colorbar: the depth track on the right is the depth legend.
+            marker=dict(size=3.5, color=v_depths, colorscale="Viridis", reversescale=True, opacity=0.9,
+                        cmin=float(v_depths.min()), cmax=float(v_depths.max()), showscale=False),
+            text=hover(everything), hoverinfo="text",
+            name="Samples (colored by depth)"
         ))
+    else:
+        # Same colors as the Net Pay dashboard: pay = green, wet = blue, non-pay = gray.
+        for key, color in (("pay", "#10B981"), ("wet", "#3B82F6"), ("non", "#94A3B8"), ("unclassified", "#E2E8F0")):
+            mask = v_class == key
+            if not counts[key]:
+                continue
+            fig.add_trace(go.Scatter3d(
+                x=v_neut[mask], y=v_denb[mask], z=v_dt[mask], mode="markers",
+                marker=dict(size=3.5, color=color, opacity=0.85),
+                text=hover(mask), hoverinfo="text",
+                name=f"{class_labels[key]} ({counts[key]} pts)",
+                legendgroup="classes"
+            ))
 
+    # 3. Depth track: gamma ray vs depth, each sample in the same color as its dot,
+    # with the sweet-spot zones in this window shaded and numbered by rank.
+    strip_x = v_gr if gr_col else np.zeros(len(v_depths))
+    strip_hover = "Depth %{y:.1f} m<br>GR %{x:.0f} API<extra></extra>" if gr_col else "Depth %{y:.1f} m<extra></extra>"
+    if gr_col:
+        fig.add_trace(go.Scatter(
+            x=strip_x, y=v_depths, mode="lines", line=dict(color="#CBD5E1", width=1),
+            hoverinfo="skip", showlegend=False
+        ), row=1, col=2)
+    if color_by == "depth":
+        fig.add_trace(go.Scatter(
+            x=strip_x, y=v_depths, mode="markers",
+            marker=dict(size=4, color=v_depths, colorscale="Viridis", reversescale=True,
+                        cmin=float(v_depths.min()), cmax=float(v_depths.max())),
+            hovertemplate=strip_hover, showlegend=False
+        ), row=1, col=2)
+    else:
+        for key, color in (("pay", "#10B981"), ("wet", "#3B82F6"), ("non", "#94A3B8"), ("unclassified", "#E2E8F0")):
+            mask = v_class == key
+            if np.any(mask):
+                fig.add_trace(go.Scatter(
+                    x=strip_x[mask], y=v_depths[mask], mode="markers",
+                    marker=dict(size=4, color=color),
+                    hovertemplate=strip_hover, showlegend=False
+                ), row=1, col=2)
+    lo, hi = float(v_depths.min()), float(v_depths.max())
+    try:
+        zones = scan_reservoir_sweetspots(well_id).get("sweetspots", [])
+    except Exception:
+        zones = []
+    # Plain shapes on the track's own axes ("x domain" / "y"): add_hrect(row, col)
+    # inspects every trace for an xaxis and fails on the 3D traces in this figure.
+    for z in zones:
+        if z["base_depth"] >= lo and z["top_depth"] <= hi:
+            y0, y1 = max(z["top_depth"], lo), min(z["base_depth"], hi)
+            fig.add_shape(type="rect", xref="x domain", x0=0, x1=1, yref="y", y0=y0, y1=y1,
+                          fillcolor="rgba(16, 185, 129, 0.12)", line_width=0, layer="below")
+            if z["rank"] <= 5:  # number only the top zones; thin ones would pile up
+                fig.add_annotation(xref="x domain", x=1, yref="y", y=y0, text=f"#{z['rank']}",
+                                   showarrow=False, xanchor="right", yanchor="top",
+                                   font=dict(size=9, color="#047857"))
+    fig.update_yaxes(autorange="reversed", title_text="Depth (m)", row=1, col=2)
+    fig.update_xaxes(title_text="Gamma ray (API)" if gr_col else "", showticklabels=bool(gr_col), row=1, col=2)
+
+    color_note = "colors = net pay rules" if color_by == "pay" else "colors = depth"
     fig.update_layout(
         title=dict(
-            text=f"<b>3D Petrophysical Cluster Space: {well_id}</b> ({v_depths.min():.1f}m – {v_depths.max():.1f}m)",
+            text=f"<b>3D crossplot: {well_id}</b> ({v_depths.min():.0f}–{v_depths.max():.0f} m) · {color_note}",
             x=0.02,
             xanchor="left",
             font=dict(size=14, color="#0F172A")
         ),
         template="plotly_white",
         scene=dict(
-            xaxis=dict(
-                title=dict(text="Neutron Porosity (NPHI, v/v)", font=dict(size=11, color="#0F172A")),
-                range=[min_x, side_x],
-                backgroundcolor="#F8FAFC",
-                gridcolor="#E2E8F0",
-                showbackground=True,
-                zerolinecolor="#CBD5E1"
-            ),
-            yaxis=dict(
-                title=dict(text="Bulk Density (RHOB, g/cc)", font=dict(size=11, color="#0F172A")),
-                range=[back_y, min_y],
-                backgroundcolor="#F1F5F9",
-                gridcolor="#E2E8F0",
-                showbackground=True,
-                zerolinecolor="#CBD5E1"
-            ),
-            zaxis=dict(
-                title=dict(text="Compressional Slowness (DT, µs/ft)", font=dict(size=11, color="#0F172A")),
-                range=[floor_z, max_z],
-                backgroundcolor="#F8FAFC",
-                gridcolor="#E2E8F0",
-                showbackground=True,
-                zerolinecolor="#CBD5E1"
-            ),
-            camera=dict(
-                eye=dict(x=1.35, y=-1.50, z=0.92),
-                center=dict(x=0.0, y=0.0, z=-0.05)
-            ),
+            xaxis=dict(title=dict(text="Neutron (v/v)", font=dict(size=11, color="#0F172A")),
+                       range=[min_x, max_x], gridcolor="#E2E8F0", backgroundcolor="#FFFFFF"),
+            # 3D scenes ignore a reversed [max, min] range; autorange="reversed" is
+            # what actually puts low density (more porosity) at the top.
+            yaxis=dict(title=dict(text="Density (g/cc)", font=dict(size=11, color="#0F172A")),
+                       autorange="reversed", gridcolor="#E2E8F0", backgroundcolor="#FFFFFF"),
+            zaxis=dict(title=dict(text="Sonic (µs/ft)", font=dict(size=11, color="#0F172A")),
+                       range=[min_z, max_z], gridcolor="#E2E8F0", backgroundcolor="#FFFFFF"),
+            # Open face-on, looking down the sonic axis: it starts as the standard
+            # density-neutron crossplot (neutron right, density increasing down),
+            # where upper-left = porous / gas and lower-right = shale. Rotate to
+            # bring in sonic. Orthographic: no perspective, so positions read true.
+            camera=dict(eye=dict(x=0, y=0, z=2.2), up=dict(x=0, y=1, z=0),
+                        center=dict(x=0, y=0, z=0), projection=dict(type="orthographic")),
             aspectmode="cube"
         ),
         legend=dict(
-            orientation="v",
+            orientation="h",
             yanchor="top",
-            y=0.98,
+            y=-0.02,
             xanchor="left",
-            x=1.02,
-            bgcolor="rgba(255, 255, 255, 0.92)",
-            bordercolor="#E2E8F0",
-            borderwidth=1,
+            x=0.0,
             font=dict(size=10, color="#334155"),
             itemsizing="constant"
         ),
         height=680,
-        margin=dict(l=30, r=170, t=50, b=40)
+        margin=dict(l=10, r=10, t=50, b=10)
     )
 
     return {
         "well_id": well_id,
+        "color_by": color_by,
         "samples_rendered": int(len(v_depths)),
         "min_depth": float(v_depths.min()),
         "max_depth": float(v_depths.max()),
-        "facies_counts": {
-            fname: int(np.sum(facies_arr == fname))
-            for fname, _ in facies_config
+        "class_counts": {
+            "pay": counts["pay"],
+            "wet_reservoir": counts["wet"],
+            "non_reservoir": counts["non"],
+            "unclassified": counts["unclassified"],
         },
+        "methodology": (f"{methods['vsh']}; {methods['phi']}; {methods['sw']}. "
+                        f"Same cutoffs as net pay: Vsh ≤ {VSH_CUTOFF:g}, Phi ≥ {PHI_CUTOFF:g}, Sw ≤ {SW_CUTOFF:g}."),
+        "note": "Exploratory view; mineral trend lines are approximate. Read values from the 2D crossplot.",
         "figure_json": _tag(fig, "3d", well_id).to_json()
     }
 
@@ -1930,11 +1775,10 @@ def plot_3d_wellbore_trajectory(
     highlight_top: Optional[float] = None,
     highlight_base: Optional[float] = None,
     highlight_label: Optional[str] = None,
-    show_horizon: bool = True
 ) -> Dict[str, Any]:
-    """Generates an interactive 3D Subsurface Wellbore Trajectory with sweet spot pay zones,
-    dynamic trajectory attribute coloring (Sweet Spots, RDEEP, GR, TVDSS), a contoured
-    geological reservoir horizon, and optional sweet-spot target beacon highlight.
+    """Interactive 3D wellbore view (illustrative XY path) with computed pay
+    flags along the hole, attribute coloring (Sweet Spots, RDEEP, GR, TVDSS) and
+    an optional sweet-spot target beacon highlight.
     """
     las, df = read_las(well_id)
     cols = {c.upper(): c for c in df.columns}
@@ -2064,72 +1908,6 @@ def plot_3d_wellbore_trajectory(
                 line=dict(color="#059669", width=6),
                 name="Hydrocarbon Pay Zone (Sweet Spot)"
             ))
-
-    # ── Illustrative Top-Pay Surface ────────────────────────────────────────
-    # NOT a mapped horizon: there are no picked tops from other wells to grid,
-    # so this is a decorative surface anchored at the first pay sample. Its
-    # dip and undulation are invented and must not be reported as measured.
-    if show_horizon and np.any(is_pay):
-        pay_top_z = float(z[is_pay][0])
-        gx, gy = np.meshgrid(np.linspace(-160, 160, 40), np.linspace(-120, 220, 40))
-        dip_x, dip_y = 0.042, -0.025
-        undulation = (
-            3.5 * np.sin(gx / 80.0) * np.cos(gy / 110.0)
-            + 1.8 * np.sin(gx / 45.0 + 0.7)
-        )
-        gz = pay_top_z + dip_x * gx + dip_y * gy + undulation
-
-        fig.add_trace(go.Surface(
-            x=gx,
-            y=gy,
-            z=gz,
-            opacity=0.52,
-            colorscale="Earth",         # geological look
-            showscale=True,
-            colorbar=dict(
-                title=dict(text="<b>TVDSS (m)</b>", side="right"),
-                thickness=10,
-                len=0.45,
-                x=0.02,
-                xanchor="left",
-                tickfont=dict(size=9)
-            ),
-            contours=dict(
-                z=dict(show=True, usecolormap=True, width=1.5, project=dict(z=False))
-            ),
-            hovertemplate="Surface z: %{z:.1f} m<extra>Illustrative top-pay surface</extra>",
-            name="Illustrative Top-Pay Surface"
-        ))
-
-        # Elevated leader-line pin above the horizon
-        pin_x = float(dev_x[np.where(is_pay)[0][0]])
-        pin_y = float(dev_y[np.where(is_pay)[0][0]])
-        label_z_offset = abs(float(z.max() - z.min())) * 0.08 + 12.0
-
-        # Vertical leader line from horizon to label
-        fig.add_trace(go.Scatter3d(
-            x=[pin_x, pin_x],
-            y=[pin_y, pin_y],
-            z=[pay_top_z, pay_top_z - label_z_offset],
-            mode="lines",
-            line=dict(color="#f59e0b", width=2, dash="dot"),
-            showlegend=False,
-            hoverinfo="skip",
-            name="_horizon_leader"
-        ))
-
-        fig.add_trace(go.Scatter3d(
-            x=[pin_x],
-            y=[pin_y],
-            z=[pay_top_z - label_z_offset],
-            mode="text+markers",
-            marker=dict(size=9, color="#f59e0b", symbol="diamond", line=dict(color="#b45309", width=1.5)),
-            text=[f"<b>First pay sample</b><br>{'TVDSS' if tvd_col else 'MD'} ≈ {abs(pay_top_z):.1f} m"],
-            textposition="top center",
-            textfont=dict(color="#78350f", size=11, family="monospace"),
-            hoverinfo="text",
-            name="First Pay Sample"
-        ))
 
     # ── Sweet Spot Highlight Beacon ──────────────────────────────────────────
     hl_focus = None

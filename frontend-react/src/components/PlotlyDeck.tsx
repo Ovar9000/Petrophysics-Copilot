@@ -150,12 +150,12 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
   const [loading3d, setLoading3d] = useState<boolean>(false);
   const [loadingTab, setLoadingTab] = useState<boolean>(false);
   const [current3dMode, setCurrent3dMode] = useState<'trajectory' | 'cube'>('cube');
+  const [cubeColorBy, setCubeColorBy] = useState<'pay' | 'depth'>('pay');
   const [trajColorBy, setTrajColorBy] = useState<'sweetspots' | 'rdeep' | 'gr' | 'tvdss'>('sweetspots');
   const [depthMin, setDepthMin] = useState<number>(1800);
   const [depthMax, setDepthMax] = useState<number>(2000);
   const [depthMarker, setDepthMarker] = useState<number | null>(null);
   const [showCorrelationLine, setShowCorrelationLine] = useState<boolean>(true);
-  const [showHorizon, setShowHorizon] = useState<boolean>(true);
   const [highlightedSweetspot, setHighlightedSweetspot] = useState<{
     label: string;
     top: number;
@@ -292,7 +292,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     highlightTop?: number,
     highlightBase?: number,
     highlightLabelStr?: string,
-    horizonOverride?: boolean
+    cubeColorOverride?: 'pay' | 'depth'
   ) => {
     setLoading3d(true);
     setCurrent3dMode(mode);
@@ -300,7 +300,6 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     const top = customTop !== undefined ? customTop : depthMin;
     const bot = customBot !== undefined ? customBot : depthMax;
     const activeColor = customColorBy !== undefined ? customColorBy : trajColorBy;
-    const useHorizon = horizonOverride !== undefined ? horizonOverride : showHorizon;
     if (customColorBy !== undefined) {
       setTrajColorBy(customColorBy);
     }
@@ -309,10 +308,11 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       const body: any = { well_id: well, top_depth: top, bottom_depth: bot };
       if (mode === 'trajectory') {
         body.color_by = activeColor;
-        body.show_horizon = useHorizon;
         if (highlightTop !== undefined) body.highlight_top = highlightTop;
         if (highlightBase !== undefined) body.highlight_base = highlightBase;
         if (highlightLabelStr !== undefined) body.highlight_label = highlightLabelStr;
+      } else {
+        body.color_by = cubeColorOverride ?? cubeColorBy;
       }
       const data = await postTool<{ figure_json?: string }>(endpoint, body);
       if (data?.figure_json) {
@@ -839,7 +839,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                     }`}
                   >
                     <Box className="w-3.5 h-3.5 text-zinc-600" />
-                    3D Petrophysical Cluster Space (NPHI · RHOB · DT)
+                    3D Crossplot (neutron · density · sonic)
                   </button>
                   <button
                     onClick={() => loadDirect3D('trajectory', selectedWell, depthMin, depthMax)}
@@ -941,6 +941,35 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                 </div>
               </div>
 
+              {/* 3D crossplot: color by pay rules or by depth */}
+              {current3dMode === 'cube' && (
+                <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-zinc-100/70 border-t border-zinc-200 text-xs font-mono">
+                  <span className="text-zinc-600 font-semibold uppercase text-[10px]">Color dots by:</span>
+                  <div className="flex items-center gap-1">
+                    {([
+                      { key: 'pay', label: 'Pay (net pay rules)' },
+                      { key: 'depth', label: 'Depth' }
+                    ] as const).map((opt) => (
+                      <button
+                        key={opt.key}
+                        onClick={() => {
+                          setCubeColorBy(opt.key);
+                          loadDirect3D('cube', selectedWell, depthMin, depthMax, undefined, undefined, undefined, undefined, opt.key);
+                        }}
+                        disabled={loading3d}
+                        className={`px-2 py-0.5 rounded text-[11px] transition-colors cursor-pointer border ${
+                          cubeColorBy === opt.key
+                            ? 'bg-zinc-900 text-white border-zinc-900 font-medium shadow-2xs'
+                            : 'bg-white text-zinc-600 border-zinc-200 hover:bg-zinc-100'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {/* Trajectory Color By Switcher */}
               {current3dMode === 'trajectory' && (
                 <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-1.5 bg-zinc-100/70 border-t border-zinc-200 text-xs font-mono">
@@ -971,24 +1000,6 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                 </div>
               )}
 
-              {/* Show Geological Horizon Toggle */}
-              {current3dMode === 'trajectory' && (
-                <div className="flex items-center gap-2 px-3 py-1 bg-amber-50/70 border-t border-amber-100 text-xs font-mono">
-                  <label className="flex items-center gap-1.5 cursor-pointer select-none text-amber-800">
-                    <input
-                      type="checkbox"
-                      checked={showHorizon}
-                      onChange={(e) => {
-                        setShowHorizon(e.target.checked);
-                        loadDirect3D('trajectory', selectedWell, depthMin, depthMax, undefined, undefined, undefined, undefined, e.target.checked);
-                      }}
-                      className="accent-amber-600 w-3.5 h-3.5"
-                    />
-                    <span className="font-semibold">Show Top-Pay Surface</span>
-                    <span className="text-amber-600/70 text-[10px]">(illustrative, not a mapped horizon; wellbore XY path is also illustrative)</span>
-                  </label>
-                </div>
-              )}
             </div>
 
             {/* Active Target Locator Banner */}

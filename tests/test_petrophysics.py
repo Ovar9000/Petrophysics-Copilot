@@ -289,6 +289,61 @@ def test_guide_after_1d_log_points_at_real_pay():
     assert all("Well1" in n["prompt"] for n in guide["next"])
 
 
+def test_3d_cube_colors_agree_with_net_pay():
+    for well, top, bot in (("Well1", 1860.0, 1960.0), ("Well2", 3626.0, 3726.0)):
+        cube = plot_3d_petrophysical_cube(well, top, bot)
+        net = compute_net_pay(well, top, bot)
+        step = net["gross_interval_m"] / cube["samples_rendered"]
+        # Same pay rules => same number of pay samples (cube drops rows lacking
+        # neutron/density/sonic, so allow a couple of samples of slack).
+        assert abs(cube["class_counts"]["pay"] * step - net["net_pay_m"]) <= 2 * step + 0.01, (well, cube["class_counts"], net["net_pay_m"])
+
+
+def test_3d_cube_depth_coloring_and_no_wall_projections():
+    res = plot_3d_petrophysical_cube("Well2", 3626.0, 3726.0, color_by="depth")
+    fig = json.loads(res["figure_json"])
+    names = [t.get("name", "") for t in fig["data"]]
+    assert not any("Floor" in n or "wall" in n.lower() for n in names), names
+    samples = [t for t in fig["data"] if t.get("name") == "Samples (colored by depth)"]
+    color = samples[0]["marker"]["color"] if len(samples) == 1 else []
+    if isinstance(color, dict):  # Plotly 6 packs numeric arrays as base64 binary
+        import base64
+        import numpy as np
+        n_colors = len(base64.b64decode(color["bdata"])) // np.dtype(color["dtype"]).itemsize
+    else:
+        n_colors = len(color)
+    assert len(samples) == 1 and n_colors == res["samples_rendered"]
+    camera = fig["layout"]["scene"]["camera"]
+    assert camera["projection"]["type"] == "orthographic"
+    # Opens face-on (looking down sonic) as the standard density-neutron chart
+    assert camera["eye"]["x"] == 0 and camera["eye"]["y"] == 0 and camera["eye"]["z"] > 0
+    assert fig["layout"]["scene"]["yaxis"]["autorange"] == "reversed"
+    # Depth track beside the cube, depth axis reversed (deeper = lower)
+    assert any(t["type"] == "scatter" for t in fig["data"])
+    assert fig["layout"]["yaxis"]["autorange"] == "reversed"
+
+
+def test_wellbore_view_has_no_invented_surface():
+    fig = json.loads(plot_3d_wellbore_trajectory("Well1")["figure_json"])
+    assert not any(t["type"] == "surface" for t in fig["data"])
+
+
+def test_3d_cube_refuses_missing_sonic_instead_of_inventing_it():
+    import pytest
+    from backend.config import DATA_DIR
+    path = DATA_DIR / "Test_NoSonic.las"
+    lines = ["~VERSION", " VERS. 2.0 :", " WRAP. NO :", "~WELL", " STRT.M 1000 :", " STOP.M 1010 :",
+             " STEP.M 0.5 :", " NULL. -999.25 :", "~CURVE", " DEPT.M :", " GR.GAPI :", " DENB.G/C3 :",
+             " NEUT.V/V :", "~ASCII"]
+    lines += [f"{1000 + i * 0.5:.1f} 40 2.30 0.20" for i in range(21)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    try:
+        with pytest.raises(ValueError, match="sonic"):
+            plot_3d_petrophysical_cube("Test_NoSonic")
+    finally:
+        path.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     test_catalog()
     test_curves_summary()

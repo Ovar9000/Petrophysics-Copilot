@@ -190,20 +190,21 @@ TOOLS_DEFINITIONS = [
     },
     {
         "name": "plot_3d_petrophysical_cube",
-        "description": "Generates an advanced 3D Petrophysical Cluster Space (X=NPHI Neutron, Y=RHOB Density reversed, Z=DT Sonic Slowness) featuring 3D mineral matrix surfaces (Rhomb/Triangle calibration planes), projected 2D floor/wall shadows, volumetric density isosurface shells, and toggleable discrete lithofacies with full petrophysical readout.",
+        "description": "Exploratory 3D crossplot of neutron (X), density (Y, reversed) and sonic (Z) with approximate sandstone/limestone/dolomite trend lines. Points are colored either with the same pay rules as net pay (pay / wet reservoir / non-reservoir) or by depth. Needs neutron, density and sonic curves.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
                 "well_id": {"type": "STRING", "description": "Well identifier (e.g. 'Well1', 'Well2')"},
                 "top_depth": {"type": "NUMBER", "description": "Optional top depth boundary in meters"},
-                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary in meters"}
+                "bottom_depth": {"type": "NUMBER", "description": "Optional bottom depth boundary in meters"},
+                "color_by": {"type": "STRING", "description": "'pay' (default) or 'depth'"}
             },
             "required": ["well_id"]
         }
     },
     {
         "name": "plot_3d_wellbore_trajectory",
-        "description": "Generates an interactive 3D Subsurface Wellbore Trajectory showing true spatial path (X, Y, TVDSS), colored by hydrocarbon pay flags with 3D reservoir top horizon surface.",
+        "description": "Interactive 3D wellbore view colored by computed pay flags along the hole. The XY path is illustrative (no deviation survey in the data); depth is TVDSS when available, otherwise MD.",
         "parameters": {
             "type": "OBJECT",
             "properties": {
@@ -362,7 +363,8 @@ def execute_tool(name: str, args: Dict[str, Any]) -> tuple[Dict[str, Any], Optio
             res = plot_3d_petrophysical_cube(
                 well_id=args["well_id"],
                 top_depth=args.get("top_depth"),
-                bottom_depth=args.get("bottom_depth")
+                bottom_depth=args.get("bottom_depth"),
+                color_by=args.get("color_by", "pay")
             )
             fig_json = res.get("figure_json")
             return {k: v for k, v in res.items() if k != "figure_json"}, fig_json

@@ -188,10 +188,11 @@ def generate_reservoir_composite_report(well_id: str, top_depth: float, bottom_d
 def plot_3d_petrophysical_cube(
     well_id: str,
     top_depth: Optional[float] = None,
-    bottom_depth: Optional[float] = None
+    bottom_depth: Optional[float] = None,
+    color_by: str = "pay"
 ) -> str:
-    """Generates an advanced 3D Petrophysical Cluster Space (NPHI vs RHOB vs DT) with mineral matrix surfaces and density shells."""
-    res = _plot_3d_petrophysical_cube(well_id, top_depth, bottom_depth)
+    """Exploratory 3D crossplot (neutron vs density vs sonic), colored by the net pay rules ('pay') or by 'depth'; returns class counts."""
+    res = _plot_3d_petrophysical_cube(well_id, top_depth, bottom_depth, color_by)
     return _without_figure(res)
 
 
@@ -201,7 +202,7 @@ def plot_3d_wellbore_trajectory(
     top_depth: Optional[float] = None,
     bottom_depth: Optional[float] = None
 ) -> str:
-    """Generates an interactive 3D Subsurface Wellbore Trajectory with true spatial path and reservoir horizon surface."""
+    """3D wellbore view colored by computed pay flags; the XY path is illustrative (no deviation survey)."""
     res = _plot_3d_wellbore_trajectory(well_id, top_depth, bottom_depth)
     return _without_figure(res)
 

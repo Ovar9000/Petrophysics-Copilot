@@ -169,10 +169,11 @@ class CompositeReportRequest(BaseModel):
 
 
 class PlotCubeRequest(BaseModel):
-    """3D petrophysical cluster cube — no trajectory/highlight options apply."""
+    """3D crossplot of neutron/density/sonic; color_by is 'pay' or 'depth'."""
     well_id: str
     top_depth: Optional[float] = None
     bottom_depth: Optional[float] = None
+    color_by: str = "pay"
 
 
 class Plot3DRequest(BaseModel):
@@ -184,7 +185,6 @@ class Plot3DRequest(BaseModel):
     highlight_top: Optional[float] = None
     highlight_base: Optional[float] = None
     highlight_label: Optional[str] = None
-    show_horizon: Optional[bool] = True
 
 
 @app.get("/health")
@@ -311,15 +311,14 @@ def composite_report_endpoint(req: CompositeReportRequest):
 
 @app.post("/api/tools/plot_3d_cube")
 def plot_3d_cube_endpoint(req: PlotCubeRequest):
-    return plot_3d_petrophysical_cube(req.well_id, req.top_depth, req.bottom_depth)
+    return plot_3d_petrophysical_cube(req.well_id, req.top_depth, req.bottom_depth, req.color_by)
 
 
 @app.post("/api/tools/plot_3d_trajectory")
 def plot_3d_trajectory_endpoint(req: Plot3DRequest):
     return plot_3d_wellbore_trajectory(
         req.well_id, req.top_depth, req.bottom_depth, req.color_by,
-        req.highlight_top, req.highlight_base, req.highlight_label,
-        req.show_horizon if req.show_horizon is not None else True
+        req.highlight_top, req.highlight_base, req.highlight_label
     )
 
 
