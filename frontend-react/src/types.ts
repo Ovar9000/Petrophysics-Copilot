@@ -7,8 +7,15 @@ export interface CurveInfo {
   max: number | null;
 }
 
+export interface DepthWindow {
+  top: number;
+  bottom: number;
+  marker: number;
+  basis: string;
+}
+
 export interface WellData {
-  well_id?: string;
+  well_id: string;
   well_name: string;
   uwi: string;
   start_depth: number;
@@ -17,7 +24,23 @@ export interface WellData {
   total_curves: number;
   curves: CurveInfo[];
   available_mnemonics: string[];
+  capabilities?: Record<string, boolean>;
+  default_window?: DepthWindow;
 }
+
+// "What to look at / what to ask next", built by the backend from tool results.
+export interface Guide {
+  observe: string[];
+  next: Array<{ prompt: string; why?: string }>;
+}
+
+// Default 100 m viewing window for a well (backend-derived), with a safe fallback.
+export const windowFor = (wells: WellData[], wellId: string): DepthWindow => {
+  const w = wells.find((x) => x.well_id === wellId);
+  if (w?.default_window) return w.default_window;
+  const top = w ? Math.floor(w.start_depth) : 0;
+  return { top, bottom: top + 100, marker: top + 50, basis: 'start of log' };
+};
 
 export interface ToolCallItem {
   name: string;
@@ -31,6 +54,7 @@ export interface MessageItem {
   content: string;
   toolCalls?: ToolCallItem[];
   figures?: string[];
+  guide?: Guide;
   timestamp: string;
 }
 

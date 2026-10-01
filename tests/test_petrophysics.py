@@ -233,6 +233,62 @@ def test_mcp_server_imports_as_script():
     assert out.returncode == 0, out.stderr[-500:]
 
 
+# --- Drop-in wells and suggestions -----------------------------------------
+
+def test_upload_las_then_guide_and_tools_work():
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    from backend.config import DATA_DIR
+    client = TestClient(app, raise_server_exceptions=False)
+    raw = (DATA_DIR / "Well2.las").read_bytes()
+    stored = DATA_DIR / "Test_Upload_Well.las"
+    try:
+        res = client.post("/api/wells/upload?filename=Test Upload Well.las", content=raw,
+                          headers={"Content-Type": "application/octet-stream"})
+        assert res.status_code == 200, res.text
+        body = res.json()
+        assert body["well"]["well_id"] == "Test_Upload_Well"   # sanitized, never the raw name
+        assert body["well"]["capabilities"]["net_pay"] is True
+        assert body["guide"]["next"], "uploaded well should come with starter questions"
+        # The new well is usable by every tool and listed by the API.
+        win = body["well"]["default_window"]
+        assert compute_net_pay("Test_Upload_Well", win["top"], win["bottom"])["gross_interval_m"] > 0
+        assert any(w.get("well_id") == "Test_Upload_Well" for w in client.get("/api/wells").json()["wells"])
+        # Same name again is refused rather than silently overwritten.
+        assert client.post("/api/wells/upload?filename=Test Upload Well.las", content=raw).status_code == 409
+    finally:
+        stored.unlink(missing_ok=True)
+        init_catalog()
+
+
+def test_upload_rejects_non_las():
+    from fastapi.testclient import TestClient
+    from backend.main import app
+    client = TestClient(app, raise_server_exceptions=False)
+    assert client.post("/api/wells/upload?filename=notes.txt", content=b"hello").status_code == 400
+    assert client.post("/api/wells/upload?filename=broken.las", content=b"not a las file").status_code == 400
+
+
+def test_default_window_is_centered_on_best_sweet_spot():
+    from backend.petrophysics import default_window
+    for well in ("Well1", "Well2"):
+        zone = scan_reservoir_sweetspots(well)["sweetspots"][0]
+        win = default_window(well)
+        assert win["top"] <= zone["top_depth"] and zone["base_depth"] <= win["bottom"]
+        assert abs((win["bottom"] - win["top"]) - 100) <= 1
+
+
+def test_guide_after_1d_log_points_at_real_pay():
+    from backend.agent import execute_tool
+    from backend.suggestions import suggest_next
+    result, _ = execute_tool("plot_1d_well_log", {"well_id": "Well1", "top_depth": 1860, "bottom_depth": 1960})
+    guide = suggest_next([{"name": "plot_1d_well_log", "args": {}, "result": result}], "Well1")
+    zone = scan_reservoir_sweetspots("Well1")["sweetspots"][0]
+    assert any(f"{zone['top_depth']:.0f}" in o for o in guide["observe"])
+    assert 1 <= len(guide["next"]) <= 3
+    assert all("Well1" in n["prompt"] for n in guide["next"])
+
+
 if __name__ == "__main__":
     test_catalog()
     test_curves_summary()

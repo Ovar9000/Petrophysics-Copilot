@@ -7,9 +7,17 @@ import {
   ChevronDown,
   ChevronRight,
   Loader2,
-  Database
+  Database,
+  Upload,
+  CheckCircle2,
+  AlertCircle,
+  Eye,
+  Lightbulb,
+  PanelRightOpen,
+  PanelRightClose
 } from 'lucide-react';
-import { MessageItem, ToolCallItem, WellData } from '../types';
+import { Guide, MessageItem, ToolCallItem, WellData } from '../types';
+import type { UploadStatus } from '../App';
 
 interface ChatStreamProps {
   messages: MessageItem[];
@@ -18,7 +26,124 @@ interface ChatStreamProps {
   selectedWell: string;
   onSelectWell: (well: string) => void;
   wells: WellData[];
+  onUploadFiles: (files: File[]) => void;
+  uploads: UploadStatus[];
+  deckOpen: boolean;
+  canToggleDeck: boolean;
+  onToggleDeck: () => void;
 }
+
+// Drop box for .las files: drag-and-drop or click to browse.
+const WellDropZone: React.FC<{ onFiles: (files: File[]) => void; uploads: UploadStatus[]; disabled: boolean }> = ({
+  onFiles,
+  uploads,
+  disabled
+}) => {
+  const [dragging, setDragging] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const accept = (list: FileList | null) => {
+    const files = Array.from(list || []);
+    if (files.length) onFiles(files);
+  };
+
+  return (
+    <div className="px-3 pt-3">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={() => !disabled && inputRef.current?.click()}
+        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && !disabled && inputRef.current?.click()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          if (!disabled) setDragging(true);
+        }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={(e) => {
+          e.preventDefault();
+          setDragging(false);
+          if (!disabled) accept(e.dataTransfer.files);
+        }}
+        className={`flex items-center justify-center gap-2 rounded-lg border-2 border-dashed px-3 py-2.5 text-xs cursor-pointer transition-colors ${
+          dragging ? 'border-emerald-500 bg-emerald-50 text-emerald-800' : 'border-zinc-300 bg-zinc-50/60 text-zinc-500 hover:border-zinc-400 hover:bg-zinc-50'
+        }`}
+        title="Drop .las well log files here, or click to browse"
+      >
+        <Upload className="w-4 h-4 shrink-0" />
+        <span>
+          <span className="font-semibold text-zinc-700">Drop .las well logs here</span> or click to browse
+        </span>
+        <input
+          ref={inputRef}
+          type="file"
+          accept=".las,.LAS"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            accept(e.target.files);
+            e.target.value = '';
+          }}
+        />
+      </div>
+      {uploads.length > 0 && (
+        <ul className="mt-1.5 space-y-0.5 text-[11px] font-mono">
+          {uploads.slice(-4).map((u) => (
+            <li key={u.name} className="flex items-center gap-1.5 text-zinc-600">
+              {u.state === 'uploading' && <Loader2 className="w-3 h-3 animate-spin text-zinc-500" />}
+              {u.state === 'done' && <CheckCircle2 className="w-3 h-3 text-emerald-600" />}
+              {u.state === 'error' && <AlertCircle className="w-3 h-3 text-red-600" />}
+              <span className="truncate">{u.name}</span>
+              {u.state === 'done' && <span className="text-emerald-700">loaded as {u.detail}</span>}
+              {u.state === 'error' && <span className="text-red-700 truncate">{u.detail}</span>}
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+};
+
+// "Look for" notes + clickable next questions under an answer.
+const GuidePanel: React.FC<{ guide: Guide; onAsk: (prompt: string) => void; disabled: boolean }> = ({ guide, onAsk, disabled }) => {
+  if (!guide.observe?.length && !guide.next?.length) return null;
+  return (
+    <div className="mt-2.5 pt-2.5 border-t border-zinc-100 space-y-2">
+      {guide.observe?.length > 0 && (
+        <div>
+          <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold text-zinc-500 mb-1">
+            <Eye className="w-3 h-3" /> What to look at
+          </div>
+          <ul className="list-disc pl-4 space-y-0.5 text-zinc-700">
+            {guide.observe.map((o) => (
+              <li key={o}>{o}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {guide.next?.length > 0 && (
+        <div>
+          <div className="flex items-center gap-1 text-[10px] uppercase tracking-wider font-semibold text-zinc-500 mb-1">
+            <Lightbulb className="w-3 h-3" /> Ask next
+          </div>
+          <div className="flex flex-col gap-1">
+            {guide.next.map((n) => (
+              <button
+                key={n.prompt}
+                onClick={() => onAsk(n.prompt)}
+                disabled={disabled}
+                title={n.why}
+                className="text-left px-2.5 py-1.5 rounded-md border border-zinc-200 bg-zinc-50 hover:bg-emerald-50 hover:border-emerald-300 transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <span className="text-zinc-900 font-medium">{n.prompt}</span>
+                {n.why && <span className="block text-[11px] text-zinc-500">{n.why}</span>}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
 
 export const ChatStream: React.FC<ChatStreamProps> = ({
   messages,
@@ -27,11 +152,18 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   selectedWell,
   onSelectWell,
   wells,
+  onUploadFiles,
+  uploads,
+  deckOpen,
+  canToggleDeck,
+  onToggleDeck,
 }) => {
   const [inputText, setInputText] = useState('');
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Suggestions are only offered on the latest assistant answer.
+  const lastAssistantIdx = messages.map((m) => m.role).lastIndexOf('assistant');
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -108,44 +240,52 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
   return (
     <div className="flex-1 flex flex-col bg-white border-r border-zinc-200 h-full overflow-hidden">
       {/* Minimalist Top Bar */}
-      <div className="h-12 px-4 border-b border-zinc-200 flex items-center justify-between shrink-0 bg-white">
-        <div className="flex items-center gap-3">
-          <div className="text-xs font-semibold text-zinc-900 tracking-tight flex items-center gap-1.5">
+      <div className="h-12 px-4 border-b border-zinc-200 flex items-center justify-between gap-3 shrink-0 bg-white">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="text-xs font-semibold text-zinc-900 tracking-tight flex items-center gap-1.5 whitespace-nowrap">
             <span className="w-2 h-2 rounded-full bg-emerald-500" />
             Petrophysical Copilot
           </div>
-          <span className="text-zinc-300 text-xs">|</span>
-          <span className="text-[11px] text-zinc-500 font-mono">Gemini 3.5 Flash · Unified Asset Copilot</span>
+          {!deckOpen && (
+            <span className="text-[11px] text-zinc-500 font-mono whitespace-nowrap truncate hidden lg:inline">
+              | Gemini · answers from tool results
+            </span>
+          )}
         </div>
 
-        {/* Unified Multi-Well Asset Selector */}
-        <div className="flex items-center gap-1.5 font-mono text-[11px] bg-zinc-50 border border-zinc-200 rounded-md p-1 text-zinc-600">
-          <span className="text-zinc-400 uppercase text-[10px] tracking-wider font-semibold px-1">Active:</span>
-          <button
-            onClick={() => onSelectWell('Well1')}
-            className={`flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors cursor-pointer ${
-              selectedWell === 'Well1'
-                ? 'bg-white text-zinc-900 font-semibold shadow-xs border border-zinc-200'
-                : 'text-zinc-600 hover:text-zinc-900'
-            }`}
-          >
-            <span className={`w-1.5 h-1.5 rounded-full ${selectedWell === 'Well1' ? 'bg-emerald-500' : 'bg-zinc-300'}`} />
-            <span>Well 1 (0–2500m)</span>
-          </button>
-          <span className="text-zinc-300">·</span>
-          <button
-            onClick={() => onSelectWell('Well2')}
-            className={`flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors cursor-pointer ${
-              selectedWell === 'Well2'
-                ? 'bg-white text-zinc-900 font-semibold shadow-xs border border-zinc-200'
-                : 'text-zinc-600 hover:text-zinc-900'
-            }`}
-          >
-            <span className={`w-1.5 h-1.5 rounded-full ${selectedWell === 'Well2' ? 'bg-emerald-500' : 'bg-zinc-300'}`} />
-            <span>Well 2 (1176–3960m)</span>
-          </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Active well: any loaded well, including dropped-in files */}
+          <label className="flex items-center gap-1.5 font-mono text-[11px] bg-zinc-50 border border-zinc-200 rounded-md px-2 py-1 text-zinc-600">
+            <span className="text-zinc-400 uppercase text-[10px] tracking-wider font-semibold hidden xl:inline">Active:</span>
+            <span className={`w-1.5 h-1.5 rounded-full ${selectedWell ? 'bg-emerald-500' : 'bg-zinc-300'}`} />
+            <select
+              value={selectedWell}
+              onChange={(e) => onSelectWell(e.target.value)}
+              className="bg-transparent text-zinc-900 font-semibold focus:outline-none cursor-pointer max-w-[220px]"
+              disabled={wells.length === 0}
+            >
+              {wells.length === 0 && <option value="">no wells loaded</option>}
+              {wells.map((w) => (
+                <option key={w.well_id} value={w.well_id}>
+                  {w.well_id} ({Math.round(w.start_depth)}–{Math.round(w.stop_depth)} m)
+                </option>
+              ))}
+            </select>
+          </label>
+          {canToggleDeck && (
+            <button
+              onClick={onToggleDeck}
+              className="flex items-center gap-1 px-2 py-1 rounded-md border border-zinc-200 bg-white hover:bg-zinc-50 text-zinc-600 text-[11px] font-mono cursor-pointer"
+              title={deckOpen ? 'Hide the plot window' : 'Show the plot window'}
+            >
+              {deckOpen ? <PanelRightClose className="w-3.5 h-3.5" /> : <PanelRightOpen className="w-3.5 h-3.5" />}
+              <span className="hidden xl:inline">{deckOpen ? 'Hide plots' : 'Show plots'}</span>
+            </button>
+          )}
         </div>
       </div>
+
+      <WellDropZone onFiles={onUploadFiles} uploads={uploads} disabled={isLoading} />
 
       {/* Messages Stream */}
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
@@ -199,6 +339,10 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
                   </ReactMarkdown>
                 </div>
 
+                {!isUser && msg.guide && mIdx === lastAssistantIdx && (
+                  <GuidePanel guide={msg.guide} onAsk={onSendMessage} disabled={isLoading} />
+                )}
+
                 <div className="mt-1 text-[10px] text-zinc-400 font-mono text-right">
                   {msg.timestamp}
                 </div>
@@ -225,7 +369,7 @@ export const ChatStream: React.FC<ChatStreamProps> = ({
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="Ask about Well 1, Well 2, compare sweet spots across the asset, or request 1D/3D plots..."
+            placeholder={selectedWell ? `Ask about ${selectedWell}, e.g. "Show the 1D log", "Scan for sweet spots"...` : 'Drop a .las file above to get started...'}
             className="flex-1 bg-transparent text-xs text-zinc-900 placeholder-zinc-400 focus:outline-none resize-none font-sans py-1 max-h-28"
             disabled={isLoading}
           />

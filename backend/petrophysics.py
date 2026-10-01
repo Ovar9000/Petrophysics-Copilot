@@ -91,7 +91,7 @@ def get_well_curves_summary(well_id: str) -> Dict[str, Any]:
     step = float(las.well.STEP.value) if "STEP" in las.well else 0.1524
 
     return {
-        "well_id": well_id,
+        "well_id": _find_las_path(well_id).stem,
         "well_name": las.well.WELL.value if "WELL" in las.well else well_id,
         "uwi": las.well.UWI.value if "UWI" in las.well else "UNKNOWN",
         "start_depth": round(start_depth, 2),
@@ -100,7 +100,68 @@ def get_well_curves_summary(well_id: str) -> Dict[str, Any]:
         "total_curves": len(curves_info),
         "curves": curves_info,
         "available_mnemonics": [c["mnemonic"] for c in curves_info],
+        "capabilities": well_capabilities(df),
+        "default_window": default_window(well_id),
     }
+
+
+# Mnemonic families the tools look for (first match wins in each tool).
+CURVE_FAMILIES: Dict[str, Tuple[str, ...]] = {
+    "gamma_ray": ("GR",),
+    "resistivity": ("RDEEP", "ILD", "LLD", "RT"),
+    "density": ("DENB", "RHOB", "RHOZ"),
+    "neutron": ("NEUT", "NPHI", "TNPH", "CNC"),
+    "sonic": ("DTCOMP", "DT"),
+    "caliper": ("CALI", "CAL"),
+}
+
+
+def well_capabilities(df: pd.DataFrame) -> Dict[str, bool]:
+    """Which curve families have real (non-null) data, so the UI and the
+    suggestion engine only offer analyses the file can support."""
+    cols = {str(c).upper(): c for c in df.columns}
+    caps = {}
+    for family, names in CURVE_FAMILIES.items():
+        caps[family] = any(n in cols and df[cols[n]].notna().any() for n in names)
+    # Net pay needs shale (GR or VSHALE), porosity (density or PHIE) and Sw (resistivity or SWE)
+    has = lambda n: n in cols and df[cols[n]].notna().any()
+    caps["net_pay"] = ((caps["gamma_ray"] or has("VSHALE"))
+                       and (caps["density"] or has("PHIE"))
+                       and (caps["resistivity"] or has("SWE")))
+    return caps
+
+
+@lru_cache(maxsize=32)
+def _default_window_cached(path_str: str, mtime: float) -> Dict[str, Any]:
+    stem = Path(path_str).stem
+    _, df = read_las(stem)
+    depths = df["DEPTH"].dropna().values
+    lo, hi = float(depths.min()), float(depths.max())
+    zones = scan_reservoir_sweetspots(stem).get("sweetspots", []) if well_capabilities(df)["net_pay"] else []
+    if zones:
+        center = (zones[0]["top_depth"] + zones[0]["base_depth"]) / 2.0
+        basis = "centered on the highest-ranked sweet spot"
+    else:
+        cols = {str(c).upper(): c for c in df.columns}
+        gr_depths = df.loc[df[cols["GR"]].notna(), "DEPTH"].values if "GR" in cols else depths
+        gr_depths = gr_depths if len(gr_depths) else depths
+        center = float((gr_depths.min() + gr_depths.max()) / 2.0)
+        basis = "middle of the logged interval (no sweet spot found)"
+    top = max(lo, center - 50.0)
+    bottom = min(hi, top + 100.0)
+    top = max(lo, bottom - 100.0)
+    return {"top": round(top), "bottom": round(bottom), "marker": round(center, 1), "basis": basis}
+
+
+def default_window(well_id: str) -> Dict[str, Any]:
+    """A 100 m viewing window per well, derived from its own data (never
+    hard-coded), used as the starting depth range for plots and suggestions."""
+    p = _find_las_path(well_id)
+    return dict(_default_window_cached(str(p), p.stat().st_mtime))
+
+
+def list_well_ids() -> List[str]:
+    return sorted(p.stem for p in DATA_DIR.glob("*.las"))
 
 
 def _calc_crossover_polygons(
@@ -193,7 +254,6 @@ PAY_MODEL: Dict[str, Any] = dict(
     den_candidates=("DENB", "RHOB"),
     rdeep_candidates=("RDEEP", "ILD", "RT"),
 )
-DEFAULT_MARKER_DEPTH = {"well1": 1908.0, "well2": 3650.0}
 # Mineral matrix trendline colors (single cluster where a palette pays off;
 # other charts reuse blues/reds with different local meanings, so they stay local)
 MATRIX_COLORS = {"sandstone": "#eab308", "limestone": "#0284c7", "dolomite": "#dc2626"}
@@ -400,12 +460,15 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
     cali_col = cols.get("CALI") or cols.get("CAL")
     
     has_cali = bool(cali_col and cali_col in df and np.any(~np.isnan(df[cali_col].values)))
-    track1_title = "Track 1: Gamma Ray & Caliper" if has_cali else "Track 1: Gamma Ray & Bit Size"
+    # Short track titles: the three tracks share half a screen in the UI, so
+    # long titles overlapped each other.
+    track1_title = "GR · Caliper" if has_cali else "Gamma ray"
+    track_titles = [track1_title, "Resistivity", "Density · Neutron"]
     
     fig = make_subplots(
         rows=1, cols=3,
         shared_yaxes=True,
-        subplot_titles=[track1_title, "Track 2: Resistivity (log scale)", "Track 3: Density - Neutron Crossover"],
+        subplot_titles=track_titles,
         horizontal_spacing=0.04
     )
     
@@ -579,7 +642,7 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
     
     # 1 Continuous Horizontal Line across all 3 graphs (xref='paper', yref='y')
     if marker_depth is None:
-        candidate = DEFAULT_MARKER_DEPTH.get(str(well_id).lower(), 1908.0)
+        candidate = default_window(well_id)["marker"]
         if min_d <= candidate <= max_d:
             marker_depth = candidate
         else:
@@ -647,9 +710,9 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
     
     # Move subplot title annotations up so they sit cleanly above top axes
     for a in fig.layout.annotations:
-        if a.text and a.text.startswith("Track"):
+        if a.text in track_titles:
             a.yshift = 32
-            a.font = dict(size=11, color="#0f172a")
+            a.font = dict(size=10, color="#0f172a")
 
     depth_span = max_d - min_d
     plot_height = max(740, min(1200, int(depth_span * 7.4)))
@@ -657,7 +720,7 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
     well_title = las.well.WELL.value if "WELL" in las.well else well_id
     layout_dict = dict(
         title=dict(
-            text=f"<b>1D Petrophysical Log: {well_title}</b> ({min_d:.1f}m - {max_d:.1f}m)",
+            text=f"<b>{well_title}</b> · {min_d:.0f}–{max_d:.0f} m",
             x=0.5,
             y=0.985,
             xanchor="center",

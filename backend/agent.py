@@ -24,6 +24,8 @@ from backend.petrophysics import (
     generate_reservoir_composite_report,
     plot_3d_petrophysical_cube,
     plot_3d_wellbore_trajectory,
+    default_window,
+    list_well_ids,
 )
 from backend.catalog import query_catalog
 
@@ -219,18 +221,15 @@ TOOLS_DEFINITIONS = [
             "type": "OBJECT",
             "properties": {
                 "query": {"type": "STRING", "description": "Search query keywords"},
-                "well_name": {"type": "STRING", "description": "Optional well name filter ('Well1' or 'Well2')"}
+                "well_name": {"type": "STRING", "description": "Optional well id filter (e.g. 'Well1')"}
             },
             "required": ["query"]
         }
     }
 ]
 
-SYSTEM_PROMPT = """You are a petrophysics assistant for a two-well log dataset. You answer by calling tools and reporting what they return.
-
-Data available:
-1. Well 1: LAS log, 0-2500 m MD, 25 curves (includes VSHALE, PHIE, SWE and TVDSS). A useful starting interval is 1850-1950 m.
-2. Well 2: LAS log, 1176-3960 m MD, 11 curves (no TVD, no pre-computed Vsh/porosity/Sw). A useful starting interval is 3590-3850 m.
+SYSTEM_PROMPT = """You are a petrophysics assistant for well log (LAS) data. You answer by calling tools and reporting what they return.
+The wells currently loaded (the user can drop in new LAS files at any time) are listed at the end of these instructions; use their exact ids as well_id.
 
 Rules:
 1. GROUNDING (most important):
@@ -239,11 +238,13 @@ Rules:
    - Mention the key assumptions a tool reports (cutoffs, "assumed" defaults, the methodology string, "illustrative" notes).
    - The 3D wellbore path and top-pay surface are illustrative, not surveyed or mapped; never describe their positions or dip as measured.
 2. WELLS:
-   - Always say which well a result belongs to, using a `### Well 1` / `### Well 2` header when discussing both.
+   - Always say which well a result belongs to, using a `### <well id>` header when discussing several.
    - If the question names no well and is not a comparison, use the active well given below.
+   - Only call a tool if the well has the curves it needs (listed below); otherwise say which curve is missing.
 3. STYLE:
    - Be concise and plain. Explain what a log or number means in simple terms when helpful (e.g. "low gamma ray usually means clean sand").
    - Use short sections or a small table only when they help. No marketing language.
+   - Do not add "what to look at" or "what to ask next" sections: the app shows its own, built from the tool results.
 """
 
 
@@ -431,7 +432,8 @@ def run_agent_turn(
         return _generate_offline_summary(query, [], [], active_well)
 
     models_to_try = list(dict.fromkeys([GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.5-flash"]))
-    system_text = SYSTEM_PROMPT + f"\nActive well selected in the UI: {active_well or 'Well1'}\n"
+    system_text = (SYSTEM_PROMPT + "\nLoaded wells:\n" + _wells_context()
+                   + f"\nActive well selected in the UI: {active_well or 'none'}\n")
 
     contents = []
     if chat_history:
@@ -508,9 +510,31 @@ def run_agent_turn(
 
 
 _GREETING_RE = re.compile(r"\b(hi|hello|hey|help|who are you|what can you do|capabilities|overview)\b")
-_WELL1_RE = re.compile(r"\bwell\s*1\b|\bwell1\b")
-_WELL2_RE = re.compile(r"\bwell\s*2\b|\bwell2\b")
-TARGET_INTERVALS = {"Well1": (1850.0, 1950.0), "Well2": (3590.0, 3850.0)}
+MAX_OFFLINE_WELLS = 4
+
+
+def _wells_context() -> str:
+    """One line per loaded well for the system prompt (ids, range, curves)."""
+    lines = []
+    for well in list_well_ids():
+        try:
+            s = get_well_curves_summary(well)
+        except Exception as e:
+            lines.append(f"- {well}: could not be read ({e})")
+            continue
+        win = s["default_window"]
+        missing = [k for k, v in s["capabilities"].items() if not v]
+        lines.append(
+            f"- {s['well_id']}: {s['start_depth']}-{s['stop_depth']} m MD, curves "
+            f"{', '.join(s['available_mnemonics'])}. Suggested starting window {win['top']}-{win['bottom']} m."
+            + (f" Missing: {', '.join(missing)}." if missing else ""))
+    return "\n".join(lines) or "- (no wells loaded; ask the user to drop a .las file)"
+
+
+def _wells_named_in(query: str, well_ids: List[str]) -> List[str]:
+    """Well ids mentioned in the query; spaces are ignored so 'well 1' matches 'Well1'."""
+    compact = re.sub(r"\s+", "", query.lower())
+    return [w for w in well_ids if re.search(re.escape(w.lower()) + r"(?![0-9a-z])", compact)]
 
 
 def _fmt(value: Any, spec: str, scale: float = 1.0) -> str:
@@ -538,27 +562,30 @@ def _generate_offline_summary(
     note = ("_Offline summary: the language model is unavailable, so this is a fixed-format report "
             "built only from tool results. Ask again later for a written interpretation._")
 
+    all_wells = list_well_ids()
+    if not all_wells:
+        return {"text": note + "\n\nNo wells are loaded yet. Drop a .las file to get started.",
+                "figures": figures, "tool_calls": executed_tools}
+
     # Short greetings / "what can you do" -> list the data actually loaded.
     if _GREETING_RE.search(q) and len(q.split()) <= 6:
         lines = [note, "", "### Loaded wells"]
-        for well in ("Well1", "Well2"):
+        for well in all_wells:
             info, _ = run("get_well_curves_summary", {"well_id": well})
             if "error" in info:
                 lines.append(f"* **{well}**: could not be read ({info['error']})")
             else:
                 lines.append(f"* **{well}**: {info['start_depth']}–{info['stop_depth']} m MD, "
                              f"{info['total_curves']} curves")
-        lines += ["", "Try: *\"Show the 1D log for Well 1 from 1850 to 1950 m\"* or "
-                      "*\"Compute net pay for Well 2 between 3650 and 3750 m\"*."]
         return {"text": "\n".join(lines), "figures": figures, "tool_calls": executed_tools}
 
-    names1, names2 = bool(_WELL1_RE.search(q)), bool(_WELL2_RE.search(q))
-    if (names1 and names2) or "compare" in q or "both" in q:
-        wells = ["Well1", "Well2"]
-    elif names1 or names2:
-        wells = ["Well1"] if names1 else ["Well2"]
+    named = _wells_named_in(query, all_wells)
+    if "compare" in q or "both" in q or "all wells" in q:
+        wells = (named if len(named) > 1 else all_wells)[:MAX_OFFLINE_WELLS]
+    elif named:
+        wells = named[:MAX_OFFLINE_WELLS]
     else:
-        wells = [active_well if active_well in TARGET_INTERVALS else "Well1"]
+        wells = [active_well if active_well in all_wells else all_wells[0]]
 
     sections = [note]
     for well in wells:
@@ -597,7 +624,8 @@ def _generate_offline_summary(
             plot_top, plot_bot = top - 20.0, base + 20.0
         else:
             sections.append("No zone passed all cutoffs.")
-            plot_top, plot_bot = TARGET_INTERVALS.get(well, (None, None))
+            win = default_window(well)
+            plot_top, plot_bot = win["top"], win["bottom"]
 
         if not figures:
             _, fig = run("plot_1d_well_log", {"well_id": well, "top_depth": plot_top, "bottom_depth": plot_bot})

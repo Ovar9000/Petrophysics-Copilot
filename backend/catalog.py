@@ -17,9 +17,10 @@ def init_catalog() -> List[Dict[str, Any]]:
     global _CATALOG_CACHE
     _CATALOG_CACHE = []
 
+    # Every LAS in DATA_DIR (including uploads); a geology report is optional.
     wells = [
-        {"file": "Well1.las", "report": "Well1_geology_report.md", "id": "Well1"},
-        {"file": "Well2.las", "report": "Well2_geology_report.md", "id": "Well2"}
+        {"file": p.name, "report": f"{p.stem}_geology_report.md", "id": p.stem}
+        for p in sorted(DATA_DIR.glob("*.las"))
     ]
 
     for item in wells:
@@ -28,7 +29,10 @@ def init_catalog() -> List[Dict[str, Any]]:
         if not las_path.exists():
             continue
 
-        las = lasio.read(str(las_path))
+        try:
+            las = lasio.read(str(las_path))
+        except Exception:
+            continue  # an unreadable file must not take the whole catalog down
         well_name = str(las.well.WELL.value if "WELL" in las.well else item["id"]).strip()
         uwi = str(las.well.UWI.value if "UWI" in las.well else "UNKNOWN").strip()
         start_depth = float(las.well.STRT.value) if "STRT" in las.well else 0.0
@@ -52,6 +56,7 @@ def init_catalog() -> List[Dict[str, Any]]:
                 lithology_notes = content[1200:]
 
         record = {
+            "well_id": item["id"],
             "well_name": well_name,
             "uwi": uwi,
             "start_depth": round(start_depth, 2),
@@ -82,7 +87,9 @@ def query_catalog(query_text: str, well_name: Optional[str] = None) -> List[Dict
 
     scored: List[tuple[int, Dict[str, Any]]] = []
     for item in _CATALOG_CACHE:
-        if well_name and well_name.lower() not in item["well_name"].lower():
+        # Match the file-based well id exactly, or a substring of the LAS header name
+        wanted = (well_name or "").lower()
+        if wanted and wanted != item["well_id"].lower() and wanted not in item["well_name"].lower():
             continue
 
         clean_item = {k: v for k, v in item.items() if k != "search_corpus"}

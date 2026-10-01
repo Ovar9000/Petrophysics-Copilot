@@ -83,7 +83,32 @@ import {
   Compass,
   CheckCircle2
 } from 'lucide-react';
-import { NetPayKPIs, SweetspotScanResult } from '../types';
+import { NetPayKPIs, SweetspotScanResult, WellData, windowFor } from '../types';
+
+type ViewTab = '1d' | '3d' | 'sweetspots' | '2d' | 'kpis' | 'citations';
+
+const VIEW_TABS: Array<{ key: ViewTab; label: string }> = [
+  { key: '1d', label: '1D Log' },
+  { key: '2d', label: 'Crossplot' },
+  { key: 'sweetspots', label: 'Sweet Spots' },
+  { key: 'kpis', label: 'Net Pay' },
+  { key: '3d', label: '3D View' },
+  { key: 'citations', label: 'Geology Notes' },
+];
+
+// Open on whatever the chat just produced rather than always on the 1D tab.
+const initialTab = (figJson: string | null, hasSweetspots: boolean, hasNetPay: boolean): ViewTab => {
+  if (figJson) {
+    try {
+      return plotKindOf(JSON.parse(figJson));
+    } catch {
+      /* fall through */
+    }
+  }
+  if (hasSweetspots) return 'sweetspots';
+  if (hasNetPay) return 'kpis';
+  return '1d';
+};
 
 interface PlotlyDeckProps {
   activeFigureJson: string | null;
@@ -92,6 +117,7 @@ interface PlotlyDeckProps {
   citations: Array<{ well_name: string; formation_tops: string; lithology_notes: string }>;
   selectedWell: string;
   onSelectWell?: (well: string) => void;
+  wells: WellData[];
 }
 
 export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
@@ -100,9 +126,14 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
   sweetspotsData,
   citations,
   selectedWell,
-  onSelectWell
+  onSelectWell,
+  wells
 }) => {
-  const [activeTab, setActiveTab] = useState<'1d' | '3d' | 'sweetspots' | '2d' | 'kpis' | 'citations'>('1d');
+  // Each well's default 100 m window comes from the backend (centered on its
+  // best sweet spot), so dropped-in wells work the same as the sample wells.
+  const win = windowFor(wells, selectedWell);
+  const [activeTab, setActiveTab] = useState<ViewTab>(() =>
+    initialTab(activeFigureJson, !!sweetspotsData?.sweetspots?.length, !!netPayData));
   
   interface WellVisualCache {
     '1d'?: string | null;
@@ -133,15 +164,10 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
 
   // Sync default depth ranges and correlation line marker on well change, and load active tab
   useEffect(() => {
-    if (selectedWell === 'Well1') {
-      setDepthMin(1850);
-      setDepthMax(1950);
-      setDepthMarker(1908.0);
-    } else {
-      setDepthMin(3650);
-      setDepthMax(3750);
-      setDepthMarker(3685.0);
-    }
+    const w = windowFor(wells, selectedWell);
+    setDepthMin(w.top);
+    setDepthMax(w.bottom);
+    setDepthMarker(w.marker);
     ensureTabData(activeTab, selectedWell);
   }, [selectedWell]);
 
@@ -159,6 +185,18 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       if (well === selectedWell) setActiveTab('sweetspots');
     }
   }, [sweetspotsData]);
+
+  // Net pay results from chat get their own tab, cached under the data's well.
+  useEffect(() => {
+    if (netPayData?.well_id) {
+      const well = netPayData.well_id.toLowerCase() === selectedWell.toLowerCase() ? selectedWell : netPayData.well_id;
+      setWellDataCache(prev => ({
+        ...prev,
+        [well]: { ...(prev[well] || {}), kpis: netPayData }
+      }));
+      if (well === selectedWell) setActiveTab('kpis');
+    }
+  }, [netPayData]);
 
   // React to figure emitted from chat (kind + owning well stamped by backend)
   useEffect(() => {
@@ -178,6 +216,14 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     }
   }, [activeFigureJson]);
 
+  // Default tab loads only fill an empty slot, so they never replace a figure or
+  // result that arrived from chat while the request was in flight.
+  const fillIfEmpty = (well: string, key: keyof WellVisualCache, value: any) => {
+    setWellDataCache(prev => (prev[well]?.[key]
+      ? prev
+      : { ...prev, [well]: { ...(prev[well] || {}), [key]: value } }));
+  };
+
   // Universal well-data loader for active tab
   const loadTabForWell = async (tab: typeof activeTab, well: string) => {
     if (tab === '3d') {
@@ -186,17 +232,13 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     }
 
     setLoadingTab(true);
-    const top = well === 'Well1' ? 1850 : 3650;
-    const bot = well === 'Well1' ? 1950 : 3750;
+    const { top, bottom: bot } = windowFor(wells, well);
 
     try {
       if (tab === '1d') {
         const data = await postTool<{ figure_json?: string }>('/api/tools/plot_1d', { well_id: well, top_depth: top, bottom_depth: bot });
         if (data?.figure_json) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), '1d': data.figure_json as string }
-          }));
+          fillIfEmpty(well, '1d', data.figure_json as string);
         }
       } else if (tab === '2d') {
         const data = await postTool<{ figure_json?: string }>('/api/tools/crossplot', {
@@ -208,18 +250,12 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
           bottom_depth: bot
         });
         if (data?.figure_json) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), '2d': data.figure_json as string }
-          }));
+          fillIfEmpty(well, '2d', data.figure_json as string);
         }
       } else if (tab === 'sweetspots') {
         const data = await postTool<SweetspotScanResult>('/api/tools/sweetspots', { well_id: well, min_thickness: 1.5 });
         if (data) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), sweetspots: data }
-          }));
+          fillIfEmpty(well, 'sweetspots', data);
         }
       } else if (tab === 'kpis') {
         const data = await postTool<NetPayKPIs>('/api/tools/net_pay', {
@@ -231,19 +267,13 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
           sw_cutoff: 0.5
         });
         if (data) {
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), kpis: data }
-          }));
+          fillIfEmpty(well, 'kpis', data);
         }
       } else if (tab === 'citations') {
         const res = await fetch(`${API_BASE}/api/tools/catalog?q=formation&well=${well}`);
         if (res.ok) {
           const data = await res.json();
-          setWellDataCache(prev => ({
-            ...prev,
-            [well]: { ...(prev[well] || {}), citations: data }
-          }));
+          fillIfEmpty(well, 'citations', data);
         }
       }
     } catch (e) {
@@ -387,8 +417,8 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       if (plotKindOf(spec) !== '1d') return null;
 
       // Extract depth limits
-      let dMin = selectedWell === 'Well1' ? 1850 : 3650;
-      let dMax = selectedWell === 'Well1' ? 1950 : 3750;
+      let dMin = Infinity;
+      let dMax = -Infinity;
       if (spec.data && Array.isArray(spec.data)) {
         spec.data.forEach((trace: any) => {
           if (Array.isArray(trace.y) && trace.y.length > 0) {
@@ -401,10 +431,14 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
           }
         });
       }
+      if (!Number.isFinite(dMin) || !Number.isFinite(dMax)) {
+        dMin = win.top;
+        dMax = win.bottom;
+      }
 
-      const activeDepth = depthMarker !== null 
+      const activeDepth = depthMarker !== null
         ? depthMarker 
-        : (spec.layout?.shapes?.[0]?.y0 ?? (selectedWell === 'Well1' ? 1908.0 : 3685.0));
+        : (spec.layout?.shapes?.[0]?.y0 ?? win.marker);
 
       const lightLayout = toLightLayout(
         spec,
@@ -484,7 +518,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
       console.error('Failed to parse 1D Plotly JSON:', e);
       return null;
     }
-  }, [current1dJson, depthMarker, showCorrelationLine, selectedWell]);
+  }, [current1dJson, depthMarker, showCorrelationLine, selectedWell, win.marker, win.top, win.bottom]);
 
   // Parsed 2D Crossplot
   const parsed2DPlot = useMemo(() => {
@@ -581,105 +615,72 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     URL.revokeObjectURL(url);
   };
 
+  // A view only gets a tab once it has content (asked for in chat or opened from
+  // "More views"), so asking for a 1D log doesn't open a dashboard of everything.
+  const hasView: Record<ViewTab, boolean> = {
+    '1d': !!current1dJson,
+    '2d': !!current2dJson,
+    '3d': !!current3dJson,
+    sweetspots: !!currentSweetspots?.sweetspots,
+    kpis: !!currentNetPay,
+    citations: currentCitations.length > 0,
+  };
+  const shownTabs = VIEW_TABS.filter((t) => hasView[t.key] || t.key === activeTab);
+  const moreTabs = VIEW_TABS.filter((t) => !shownTabs.includes(t));
+
   return (
     <div className="flex-1 flex flex-col bg-[#F8FAFC] h-full overflow-hidden">
-      {/* Top Navigation Tabs & Well Switcher */}
-      <div className="h-12 px-4 border-b border-zinc-200 flex items-center justify-between bg-white shrink-0">
-        <div className="flex items-center gap-6 overflow-x-auto">
-          <button
-            onClick={() => handleTabClick('1d')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap cursor-pointer ${
-              activeTab === '1d' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            1D Log Curves
-            {activeTab === '1d' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
-
-          <button
-            onClick={() => handleTabClick('3d')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
-              activeTab === '3d' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            <Layers className="w-3.5 h-3.5" />
-            <span>3D Subsurface</span>
-            {activeTab === '3d' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
-
-          <button
-            onClick={() => handleTabClick('sweetspots')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
-              activeTab === 'sweetspots' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            <span>Reservoir Sweet Spots</span>
-            {currentSweetspots && currentSweetspots.sweetspots && (
-              <span className="px-1.5 py-0.2 rounded bg-emerald-100 text-emerald-800 text-[10px] font-mono">
-                {currentSweetspots.total_sweetspots_found}
-              </span>
-            )}
-            {activeTab === 'sweetspots' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
-
-          <button
-            onClick={() => handleTabClick('2d')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap cursor-pointer ${
-              activeTab === '2d' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            2D Crossplot
-            {activeTab === '2d' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
-
-          <button
-            onClick={() => handleTabClick('kpis')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap cursor-pointer ${
-              activeTab === 'kpis' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            Net Pay Metrics
-            {activeTab === 'kpis' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
-
-          <button
-            onClick={() => handleTabClick('citations')}
-            className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap cursor-pointer ${
-              activeTab === 'citations' ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
-            }`}
-          >
-            Stratigraphy Catalog
-            {activeTab === 'citations' && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
-          </button>
+      {/* View tabs: only the views the user has asked for; the rest wait in "More views" */}
+      <div className="h-12 px-3 border-b border-zinc-200 flex items-center gap-3 bg-white shrink-0">
+        <div className="flex-1 min-w-0 flex items-center gap-5 overflow-x-auto [scrollbar-width:none]">
+          {shownTabs.map((t) => (
+            <button
+              key={t.key}
+              onClick={() => handleTabClick(t.key)}
+              className={`text-xs font-medium pb-3 pt-3 relative transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
+                activeTab === t.key ? 'text-zinc-900 font-semibold' : 'text-zinc-400 hover:text-zinc-700'
+              }`}
+            >
+              {t.key === '3d' && <Layers className="w-3.5 h-3.5" />}
+              <span>{t.label}</span>
+              {t.key === 'sweetspots' && currentSweetspots?.sweetspots && (
+                <span className="px-1.5 rounded bg-emerald-100 text-emerald-800 text-[10px] font-mono">
+                  {currentSweetspots.total_sweetspots_found}
+                </span>
+              )}
+              {activeTab === t.key && <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-zinc-900 rounded-full" />}
+            </button>
+          ))}
+          {moreTabs.length > 0 && (
+            <select
+              value=""
+              onChange={(e) => e.target.value && handleTabClick(e.target.value as ViewTab)}
+              className="text-xs text-zinc-500 hover:text-zinc-800 bg-transparent focus:outline-none cursor-pointer shrink-0"
+              title="Open another view of this well"
+            >
+              <option value="">+ More views</option>
+              {moreTabs.map((t) => (
+                <option key={t.key} value={t.key}>{t.label}</option>
+              ))}
+            </select>
+          )}
         </div>
 
-        <div className="flex items-center gap-3 shrink-0">
-          {/* Universal Inspect Well Switcher */}
-          <div className="flex items-center gap-1 bg-zinc-100 p-0.5 rounded border border-zinc-200 text-xs font-mono shadow-2xs">
-            <span className="px-1.5 text-[10px] text-zinc-400 uppercase font-sans font-semibold">Inspect:</span>
-            <button
-              onClick={() => handleInspectWell('Well1')}
-              className={`px-2 py-0.5 rounded transition-colors cursor-pointer ${
-                selectedWell === 'Well1' 
-                  ? 'bg-white text-zinc-900 font-semibold shadow-xs' 
-                  : 'text-zinc-500 hover:text-zinc-800'
-              }`}
-              title="Inspect Well 1"
+        <div className="flex items-center gap-2 shrink-0">
+          {/* Well shown in the plot window */}
+          <label className="flex items-center gap-1 bg-zinc-100 p-0.5 rounded border border-zinc-200 text-xs font-mono shadow-2xs">
+            <span className="px-1 text-[10px] text-zinc-400 uppercase font-sans font-semibold hidden xl:inline">Well</span>
+            <select
+              value={selectedWell}
+              onChange={(e) => handleInspectWell(e.target.value)}
+              className="px-1.5 py-0.5 rounded bg-white text-zinc-900 font-semibold shadow-xs focus:outline-none cursor-pointer max-w-[140px]"
+              title="Well shown in the plot window"
             >
-              Well 1
-            </button>
-            <button
-              onClick={() => handleInspectWell('Well2')}
-              className={`px-2 py-0.5 rounded transition-colors cursor-pointer ${
-                selectedWell === 'Well2' 
-                  ? 'bg-white text-zinc-900 font-semibold shadow-xs' 
-                  : 'text-zinc-500 hover:text-zinc-800'
-              }`}
-              title="Inspect Well 2"
-            >
-              Well 2
-            </button>
-          </div>
+              {wells.map((w) => (
+                <option key={w.well_id} value={w.well_id}>{w.well_id}</option>
+              ))}
+            </select>
+          </label>
 
           <button
             onClick={handleDownloadJson}
@@ -687,7 +688,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
             title="Download active plot JSON spec"
           >
             <Download className="w-3.5 h-3.5" />
-            <span>Spec</span>
+            <span className="hidden xl:inline">Spec</span>
           </button>
         </div>
       </div>
@@ -732,18 +733,18 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   {/* Depth Window Presets (100m Pay vs 200m Overview) */}
                   <div className="flex items-center gap-1 bg-white p-0.5 rounded border border-slate-200 text-xs font-mono shadow-2xs">
                     <button
-                      onClick={() => handleSwitchDepthInterval(selectedWell === 'Well1' ? 1850 : 3650, selectedWell === 'Well1' ? 1950 : 3750)}
+                      onClick={() => handleSwitchDepthInterval(win.top, win.bottom)}
                       className={`px-2 py-0.5 rounded transition-colors cursor-pointer text-[10px] ${
                         Math.abs((parsed1DPlot.dMax - parsed1DPlot.dMin) - 100) < 15
                           ? 'bg-slate-900 text-white font-medium'
                           : 'text-slate-600 hover:text-slate-900'
                       }`}
-                      title="100m Pay Window (1:1 aspect ratio matching Well 1)"
+                      title="100 m window around the best sweet spot"
                     >
                       100m Pay
                     </button>
                     <button
-                      onClick={() => handleSwitchDepthInterval(selectedWell === 'Well1' ? 1800 : 3600, selectedWell === 'Well1' ? 2000 : 3800)}
+                      onClick={() => handleSwitchDepthInterval(win.top - 50, win.bottom + 50)}
                       className={`px-2 py-0.5 rounded transition-colors cursor-pointer text-[10px] ${
                         Math.abs((parsed1DPlot.dMax - parsed1DPlot.dMin) - 200) < 15
                           ? 'bg-slate-900 text-white font-medium'
@@ -760,7 +761,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                     Click track to place line
                   </span>
                   <button
-                    onClick={() => setDepthMarker(selectedWell === 'Well1' ? 1908.0 : 3685.0)}
+                    onClick={() => setDepthMarker(win.marker)}
                     className="px-2 py-1 bg-white hover:bg-slate-100 text-slate-700 rounded border border-slate-200 font-mono text-[11px] transition-colors cursor-pointer"
                     title="Snap horizontal line to primary sweet spot"
                   >
@@ -793,7 +794,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   useResizeHandler={true}
                   className="w-full h-full"
                   style={{ width: '100%', height: '100%' }}
-                  config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+                  config={{ responsive: true, displayModeBar: 'hover', displaylogo: false }}
                   onClick={(e: any) => {
                     if (e && e.points && e.points.length > 0) {
                       const clickedY = e.points[0].y;
@@ -925,8 +926,8 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   </button>
                   <button
                     onClick={() => {
-                      const top = selectedWell === 'Well1' ? 1800 : 3550;
-                      const bot = selectedWell === 'Well1' ? 2000 : 3850;
+                      const top = win.top - 50;
+                      const bot = win.bottom + 50;
                       setDepthMin(top);
                       setDepthMax(bot);
                       loadDirect3D(current3dMode, selectedWell, top, bot);
@@ -1000,8 +1001,8 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                 <button
                   onClick={() => {
                     setHighlightedSweetspot(null);
-                    const fullTop = selectedWell === 'Well1' ? 1800 : 3550;
-                    const fullBot = selectedWell === 'Well1' ? 2000 : 3850;
+                    const fullTop = win.top - 50;
+                    const fullBot = win.bottom + 50;
                     setDepthMin(fullTop);
                     setDepthMax(fullBot);
                     loadDirect3D('trajectory', selectedWell, fullTop, fullBot, 'sweetspots');
@@ -1026,7 +1027,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   useResizeHandler={true}
                   className="w-full h-full"
                   style={{ width: '100%', height: '100%' }}
-                  config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+                  config={{ responsive: true, displayModeBar: 'hover', displaylogo: false }}
                 />
               </div>
             ) : (
@@ -1180,7 +1181,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   useResizeHandler={true}
                   className="w-full h-full"
                   style={{ width: '100%', height: '100%' }}
-                  config={{ responsive: true, displayModeBar: true, displaylogo: false }}
+                  config={{ responsive: true, displayModeBar: 'hover', displaylogo: false }}
                 />
               </div>
             ) : (

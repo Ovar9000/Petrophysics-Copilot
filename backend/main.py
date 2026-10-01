@@ -28,6 +28,8 @@ from backend.petrophysics import (
 )
 from backend.catalog import query_catalog, init_catalog
 from backend.agent import run_agent_turn
+from backend.suggestions import starter_guide, suggest_next
+from backend.well_store import MAX_UPLOAD_BYTES, UploadError, WellExistsError, save_uploaded_las
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -206,18 +208,43 @@ def list_wells():
     return {"wells": wells}
 
 
+@app.post("/api/wells/upload")
+async def upload_well(request: Request, filename: str):
+    """Add a dropped LAS file. The raw file is the request body, so no
+    multipart dependency is needed; nothing is plotted until the user asks."""
+    declared = int(request.headers.get("content-length") or 0)
+    if declared > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="File is larger than 50 MB.")
+    data = await request.body()
+    try:
+        well_id = save_uploaded_las(filename, data)
+    except WellExistsError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except UploadError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    init_catalog()  # make the new well searchable
+    return {"well": get_well_curves_summary(well_id), "guide": starter_guide(well_id)}
+
+
+@app.get("/api/guide")
+def guide_endpoint(well_id: str):
+    return starter_guide(well_id)
+
+
 @app.post("/api/chat")
 def chat_endpoint(req: ChatRequest):
     try:
         active_query = (req.message or req.query or "").strip()
         if not active_query:
             raise HTTPException(status_code=400, detail="Query message required.")
-            
+
         response = run_agent_turn(active_query, req.chat_history, req.well_id)
+        tool_calls = response.get("tool_calls", [])
         return {
             "text": response.get("text", ""),
             "figures": response.get("figures", []),
-            "tool_calls": response.get("tool_calls", []),
+            "tool_calls": tool_calls,
+            "guide": suggest_next(tool_calls, req.well_id),
             "session_id": req.session_id,
             "well_id": req.well_id or "Well1"
         }
