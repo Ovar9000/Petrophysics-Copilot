@@ -114,9 +114,15 @@ def suggest_next(tool_calls: List[Dict[str, Any]], active_well: Optional[str] = 
             g.look("Track 2: in clean sand, high deep resistivity suggests hydrocarbons; low suggests water.")
             if caps.get("net_pay"):
                 g.ask(f"Scan {well} for sweet spots", "No pay was flagged in this window; the scan checks the whole well.")
+        qc = res.get("density_quality") or {}
+        if qc.get("intervals_m"):
+            first = qc["intervals_m"][0]
+            g.look(f"Red bands on Track 3 ({qc['flagged_m']} m of this window, e.g. {_m(first[0])}–{_m(first[1])} m) "
+                   "mark where the density correction says the density reading is unreliable; don't trust "
+                   "crossover or density porosity there.")
         if caps.get("density") and caps.get("neutron"):
             g.ask(f"Crossplot density vs neutron for {well} {_between(top, bottom)}",
-                  "Shows sand, shale and gas as separate point clouds.")
+                  "Shows sand, shale and light-hydrocarbon (gas-like) points as separate clouds.")
         if caps.get("net_pay"):
             g.ask(f"Compute net pay for {well} {_between(top, bottom)}", "Quantifies the whole window.")
 
@@ -150,16 +156,20 @@ def suggest_next(tool_calls: List[Dict[str, Any]], active_well: Optional[str] = 
         unc = res.get("net_pay_uncertainty")
         if unc and unc.get("p10_m", 0) - unc.get("p90_m", 0) > 0.2 * max(net, 1e-6):
             g.look(f"Pay ranges {unc['p90_m']}–{unc['p10_m']} m across the cutoff grid, so the cutoff choice matters here.")
+        qc = res.get("density_quality") or {}
+        if qc.get("pay_on_flagged_density_m"):
+            g.look(f"{qc['pay_on_flagged_density_m']} m of this pay sits where the density reading is flagged unreliable "
+                   "(large density correction), so its porosity there is less certain.")
         g.ask(f"Show the 1D log for {well} from {_m(top)} to {_m(bottom)} m", "Check the pay intervals by eye.")
         if caps.get("density") and caps.get("neutron"):
             g.ask(f"Crossplot density vs neutron for {well} between {_m(top)} and {_m(bottom)} m",
-                  "Confirms whether the pay is gas-like (low density, low neutron).")
+                  "Shows whether the pay has a gas-like signature (low density, low neutron); logs alone cannot confirm gas vs oil.")
         g.ask(f"Scan {well} for sweet spots", "See how this interval ranks against the rest of the well.")
 
     elif name in ("plot_2d_crossplot", "plot_crossplot_picket"):
         if name == "plot_2d_crossplot":
             g.look("Points near the yellow sandstone line are clean sand; points pushed right (high neutron) are shale-rich.")
-            g.look("Points pulled up and left (low density, low neutron) show the gas effect.")
+            g.look("Points pulled up and left (low density, low neutron) are a gas-like signature: light hydrocarbon, possibly gas. Logs alone cannot tell gas from light oil.")
         else:
             g.look("Points to the right of the 100% water line have lower water saturation (more hydrocarbon).")
         top, bottom = args.get("top_depth"), args.get("bottom_depth")

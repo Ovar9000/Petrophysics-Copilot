@@ -355,6 +355,41 @@ def _contiguous_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
     return list(zip(starts, ends))
 
 
+DENSITY_QC_LIMIT = 0.05  # g/cc: a density correction larger than this means a suspect density reading
+
+
+def _density_quality(frame: pd.DataFrame, cols: Dict[str, str]) -> Tuple[Optional[Dict[str, Any]], np.ndarray]:
+    """Where the density reading is suspect, from the density-correction curve.
+
+    The density tool is a pad pressed against the borehole wall; washouts and
+    thick mudcake force a large correction (DDEN / DRHO). |correction| above
+    DENSITY_QC_LIMIT flags that sample's density (and density porosity) as
+    unreliable. Returns (summary or None if the file has no such curve, mask).
+    """
+    col = cols.get("DDEN") or cols.get("DRHO") or cols.get("DCOR")
+    depth = frame["DEPTH"].values
+    if not col:
+        return None, np.zeros(len(depth), dtype=bool)
+    vals = frame[col].values
+    bad = np.abs(np.nan_to_num(vals, nan=0.0)) > DENSITY_QC_LIMIT
+    step = float(np.median(np.diff(depth))) if len(depth) > 1 else 0.1524
+    intervals: List[List[float]] = []
+    for s, e in _contiguous_runs(bad):
+        top, base = float(depth[s]) - step / 2, float(depth[e]) + step / 2
+        if intervals and top - intervals[-1][1] < 0.5:  # merge near-adjacent runs
+            intervals[-1][1] = base
+        else:
+            intervals.append([top, base])
+    summary = {
+        "curve": col,
+        "limit_g_cc": DENSITY_QC_LIMIT,
+        "flagged_pct": round(float(np.mean(bad)) * 100, 1) if len(bad) else 0.0,
+        "flagged_m": round(float(np.sum(bad)) * step, 2),
+        "intervals_m": [[round(t, 1), round(b, 1)] for t, b in intervals],
+    }
+    return summary, bad
+
+
 def _base_layout(title: str) -> Dict[str, Any]:
     """Shared figure chrome for the single-panel 2D depth tools."""
     return dict(
@@ -598,7 +633,7 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
                         fill="toself",
                         fillcolor="rgba(250, 204, 21, 0.45)",
                         line=dict(width=0), mode="lines",
-                        name="Gas/Sand Crossover",
+                        name="Crossover (light hydrocarbon, gas-like)",
                         hoverinfo="skip"
                     ),
                     row=1, col=3
@@ -674,6 +709,22 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
             borderwidth=1,
             borderpad=3,
         )
+
+    # Density quality flag: shade Track 3 where the density correction says the
+    # density reading is unreliable (washout / mudcake), so crossover there is
+    # not trusted. Added after the correlation line, which must stay shapes[0].
+    density_qc, _ = _density_quality(df, cols)
+    if density_qc and has_porosity_track:
+        for top_q, base_q in density_qc["intervals_m"]:
+            fig.add_shape(type="rect", xref="x3 domain", x0=0, x1=1, yref="y3", y0=top_q, y1=base_q,
+                          fillcolor="rgba(220, 38, 38, 0.14)", line_width=0, layer="below",
+                          name="Density quality flag")
+        if density_qc["intervals_m"]:
+            fig.add_trace(go.Scatter(
+                x=[None], y=[None], mode="markers",
+                marker=dict(symbol="square", size=11, color="rgba(220, 38, 38, 0.35)"),
+                name=f"Density unreliable (|{density_qc['curve']}| > {DENSITY_QC_LIMIT:g} g/cc)"
+            ), row=1, col=3)
 
     # Track 1 GR Axis: Avoid flat clipping when GR reaches ~200 API in shales
     gr_max = float(np.nanmax(df[gr_col].values)) if gr_col and gr_col in df and np.any(~np.isnan(df[gr_col].values)) else 150.0
@@ -761,7 +812,8 @@ def plot_1d_well_log(well_id: str, top_depth: Optional[float] = None, bottom_dep
         "top_depth": min_d,
         "bottom_depth": max_d,
         "figure_json": _tag(fig, "1d", well_id).to_json(),
-        "summary": f"Generated 3-track composite log for {well_title} across {min_d:.1f}m - {max_d:.1f}m."
+        "summary": f"Generated 3-track composite log for {well_title} across {min_d:.1f}m - {max_d:.1f}m.",
+        "density_quality": density_qc or {"status": "no density-correction curve (DDEN/DRHO) in this file"}
     }
 
 
@@ -895,7 +947,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
                     ay=label_y,
                     axref="x",
                     ayref="y",
-                    text="<b>Gas Correction Vector</b><br><i>(Hydrocarbon crossover shift)</i>",
+                    text="<b>Gas-like shift</b><br><i>(light hydrocarbon; logs alone cannot confirm gas)</i>",
                     showarrow=True,
                     arrowhead=2,
                     arrowsize=1.0,
@@ -940,7 +992,7 @@ def plot_2d_crossplot(well_id: str, x_curve: str, y_curve: str, z_curve: Optiona
 
     well_title = las.well.WELL.value if "WELL" in las.well else well_id
     if is_rhob_nphi:
-        title_text = f"<b>Density–Neutron Crossplot: Lithology & Gas Effect</b> ({well_title})"
+        title_text = f"<b>Density–Neutron Crossplot: Lithology & Light-Hydrocarbon Effect</b> ({well_title})"
     else:
         title_text = f"<b>2D Lithology Crossplot: {y_actual} vs. {x_actual}</b> ({well_title})"
     fig.update_layout(
@@ -1068,6 +1120,11 @@ def compute_net_pay(
     methodology = (f"{vsh_method}; {phi_method}; {sw_method}. "
                    f"Cutoffs Vsh ≤ {vsh_cutoff:g}, Phi ≥ {phi_cutoff:g}, Sw ≤ {sw_cutoff:g}.")
 
+    # How much of the pay rests on a density reading the correction curve flags
+    density_qc, density_bad = _density_quality(sub_df, cols)
+    if density_qc:
+        density_qc["pay_on_flagged_density_m"] = round(float(np.sum(is_pay & density_bad)) * med_step, 2)
+
     return {
         "well_id": well_id,
         "well_name": las.well.WELL.value if "WELL" in las.well else well_id,
@@ -1087,6 +1144,7 @@ def compute_net_pay(
         "facies_breakdown": facies_breakdown,
         "cutoff_sensitivity": cutoff_sensitivity,
         "net_pay_uncertainty": net_pay_uncertainty,
+        "density_quality": density_qc or {"status": "no density-correction curve (DDEN/DRHO) in this file"},
         "methodology": methodology
     }
 
@@ -1729,7 +1787,7 @@ def plot_3d_petrophysical_cube(
                        range=[min_z, max_z], gridcolor="#E2E8F0", backgroundcolor="#FFFFFF"),
             # Open face-on, looking down the sonic axis: it starts as the standard
             # density-neutron crossplot (neutron right, density increasing down),
-            # where upper-left = porous / gas and lower-right = shale. Rotate to
+            # where upper-left = porous, possibly gas, and lower-right = shale. Rotate to
             # bring in sonic. Orthographic: no perspective, so positions read true.
             camera=dict(eye=dict(x=0, y=0, z=2.2), up=dict(x=0, y=1, z=0),
                         center=dict(x=0, y=0, z=0), projection=dict(type="orthographic")),

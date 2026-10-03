@@ -344,6 +344,56 @@ def test_3d_cube_refuses_missing_sonic_instead_of_inventing_it():
         path.unlink(missing_ok=True)
 
 
+# --- Density quality flag ----------------------------------------------------
+
+def test_1d_log_flags_unreliable_density():
+    res = plot_1d_well_log("Well2", top_depth=3590.0, bottom_depth=3850.0)
+    qc = res["density_quality"]
+    assert qc["curve"] == "DDEN" and 5 < qc["flagged_pct"] < 12 and qc["intervals_m"]
+    fig = json.loads(res["figure_json"])
+    bands = [s for s in fig["layout"]["shapes"] if s.get("name") == "Density quality flag"]
+    assert len(bands) == len(qc["intervals_m"])
+    # The depth correlation line must stay the first shape (the UI relies on its name)
+    assert fig["layout"]["shapes"][0]["name"] == "Depth Correlation Line"
+    assert any("Density unreliable" in (t.get("name") or "") for t in fig["data"])
+
+
+def test_net_pay_reports_pay_on_flagged_density():
+    qc = compute_net_pay("Well2", 3590.0, 3850.0)["density_quality"]
+    assert qc["flagged_m"] > 0 and 0 <= qc["pay_on_flagged_density_m"] <= qc["flagged_m"]
+
+
+# --- Geology reports are checked against the logs ---------------------------
+
+def _checks(well):
+    rec = next(r for r in query_catalog("formation", well) if r["well_id"] == well)
+    return rec["verification"]["checks"]
+
+
+def test_report_claims_are_checked_against_logs():
+    w2 = _checks("Well2")
+    neut = next(c for c in w2 if c.get("claimed", "").startswith("NEUT"))
+    assert neut["status"] == "contradicted" and neut["actual"]["p50"] < 0.1  # report says 0.18-0.24
+    rdeep = next(c for c in w2 if c.get("claimed", "").startswith("RDEEP"))
+    assert rdeep["status"] == "contradicted"                                  # report says 25-65 ohm.m
+    core = next(c for c in w2 if "Core plugs" in c["statement"])
+    assert core["status"] == "not_checkable"                                  # light-oil core: logs can't confirm
+
+    w1 = _checks("Well1")
+    phie = next(c for c in w1 if c.get("claimed", "").startswith("PHIE"))
+    assert phie["status"] == "consistent"
+    ntg = next(c for c in w1 if c.get("claimed", "").startswith("NTG"))
+    assert ntg["status"] == "consistent"
+    assert any(c["status"] == "not_checkable" and "no gamma-ray data" in c.get("reason", "") for c in w1)
+
+
+def test_geology_tool_result_carries_verification_through_mcp():
+    from backend.mcp_client import call_tool
+    res, _ = call_tool("query_geology_metadata", {"query": "neutron porosity", "well_id": "Well2"})
+    summary = res["results"][0]["verification"]["summary"]
+    assert summary["contradicted"] >= 3 and summary["not_checkable"] >= 1
+
+
 # --- MCP integration: the agent's tools come from, and run on, the MCP server ---
 
 def test_gemini_declarations_are_generated_from_mcp_tools():

@@ -83,7 +83,7 @@ import {
   Compass,
   CheckCircle2
 } from 'lucide-react';
-import { NetPayKPIs, SweetspotScanResult, WellData, windowFor } from '../types';
+import { CatalogRecord, NetPayKPIs, ReportCheck, SweetspotScanResult, WellData, windowFor } from '../types';
 
 type ViewTab = '1d' | '3d' | 'sweetspots' | '2d' | 'kpis' | 'citations';
 
@@ -110,11 +110,66 @@ const initialTab = (figJson: string | null, hasSweetspots: boolean, hasNetPay: b
   return '1d';
 };
 
+// Report statements checked against the logs (backend/report_check.py).
+const CHECK_STYLE: Record<ReportCheck['status'], { label: string; cls: string }> = {
+  consistent: { label: 'Matches logs', cls: 'bg-emerald-50 text-emerald-800 border-emerald-200' },
+  partly_consistent: { label: 'Partly matches', cls: 'bg-amber-50 text-amber-800 border-amber-200' },
+  contradicted: { label: 'Contradicted by logs', cls: 'bg-red-50 text-red-800 border-red-200' },
+  not_checkable: { label: 'Not checkable from logs', cls: 'bg-zinc-100 text-zinc-600 border-zinc-200' },
+};
+
+const actualText = (c: ReportCheck): string => {
+  const a = c.actual || {};
+  if (a.p50 !== undefined) return `${a.curve}: median ${a.p50} (P10–P90 ${a.p10}–${a.p90}, ${a.samples})`;
+  if (a.net_to_gross_pct !== undefined) return `NTG from logs: ${a.net_to_gross_pct}%`;
+  if (a.samples_with_crossover_pct !== undefined) return `${a.samples_with_crossover_pct}% of samples show crossover`;
+  return c.reason || '';
+};
+
+const VerificationPanel: React.FC<{ record: CatalogRecord }> = ({ record }) => {
+  const v = record.verification;
+  if (!v?.checks?.length) {
+    return <div className="text-[11px] text-zinc-500 font-mono">{v?.status || 'Not verified.'}</div>;
+  }
+  const order: ReportCheck['status'][] = ['contradicted', 'partly_consistent', 'consistent', 'not_checkable'];
+  const checks = [...v.checks].sort((a, b) => order.indexOf(a.status) - order.indexOf(b.status));
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap gap-1.5">
+        {order.filter((s) => v.summary?.[s]).map((s) => (
+          <span key={s} className={`px-2 py-0.5 rounded border text-[10px] font-mono ${CHECK_STYLE[s].cls}`}>
+            {v.summary?.[s]} {CHECK_STYLE[s].label.toLowerCase()}
+          </span>
+        ))}
+      </div>
+      <ul className="space-y-1.5">
+        {checks.map((c, i) => (
+          <li key={i} className="text-xs border border-zinc-200 rounded p-2 bg-white">
+            <div className="flex items-start gap-2">
+              <span className={`shrink-0 px-1.5 rounded border text-[10px] font-mono ${CHECK_STYLE[c.status].cls}`}>
+                {CHECK_STYLE[c.status].label}
+              </span>
+              <span className="text-zinc-800">{c.statement}</span>
+            </div>
+            {(c.claimed || c.actual || c.reason) && (
+              <div className="mt-1 ml-1 text-[11px] text-zinc-500 font-mono">
+                {c.claimed && <span>Report: {c.claimed}{c.interval_m ? ` (${c.interval_m[0]}–${c.interval_m[1]} m)` : ''}. </span>}
+                <span>{actualText(c)}</span>
+                {c.note && <span> · {c.note}</span>}
+              </div>
+            )}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+};
+
 interface PlotlyDeckProps {
   activeFigureJson: string | null;
   netPayData: NetPayKPIs | null;
   sweetspotsData: SweetspotScanResult | null;
-  citations: Array<{ well_name: string; formation_tops: string; lithology_notes: string }>;
+  citations: CatalogRecord[];
   selectedWell: string;
   onSelectWell?: (well: string) => void;
   wells: WellData[];
@@ -141,7 +196,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
     '3d'?: string | null;
     sweetspots?: SweetspotScanResult | null;
     kpis?: NetPayKPIs | null;
-    citations?: Array<{ well_name: string; formation_tops: string; lithology_notes: string }> | null;
+    citations?: CatalogRecord[] | null;
   }
 
   // Unified per-well cache so all tabs and graphs synchronize cleanly on well switch
@@ -436,9 +491,12 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
         dMax = win.bottom;
       }
 
-      const activeDepth = depthMarker !== null
-        ? depthMarker 
-        : (spec.layout?.shapes?.[0]?.y0 ?? win.marker);
+      // Use the user's marker only if it falls inside this plot; a marker kept
+      // from another window would stretch the depth axis with empty space.
+      const figMarker = (spec.layout?.shapes || []).find((s: any) => s.name === 'Depth Correlation Line')?.y0;
+      const activeDepth = depthMarker !== null && depthMarker >= dMin && depthMarker <= dMax
+        ? depthMarker
+        : (figMarker ?? (dMin + dMax) / 2);
 
       const lightLayout = toLightLayout(
         spec,
@@ -1577,17 +1635,24 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
                   <div key={idx} className="bg-white border border-zinc-200 rounded-lg p-4 space-y-3 shadow-xs">
                     <div className="flex items-center justify-between border-b border-zinc-200 pb-2">
                       <span className="text-xs font-semibold text-zinc-900 font-mono flex items-center gap-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                        {c.well_name} Geological Record
+                        <BookOpen className="w-3.5 h-3.5 text-zinc-500" />
+                        {c.well_name} geology report
                       </span>
-                      <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-100 text-zinc-600 border border-zinc-200 font-mono">
-                        Local Catalog
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 font-mono">
+                        Unverified source
                       </span>
                     </div>
 
                     <div>
                       <h4 className="text-[11px] font-semibold text-zinc-700 uppercase tracking-wider font-mono mb-1.5">
-                        Formation Tops & Intervals:
+                        Checked against the logs:
+                      </h4>
+                      <VerificationPanel record={c} />
+                    </div>
+
+                    <div>
+                      <h4 className="text-[11px] font-semibold text-zinc-700 uppercase tracking-wider font-mono mb-1.5">
+                        Report text: formation tops &amp; intervals
                       </h4>
                       <div className="text-xs text-zinc-800 bg-zinc-50 p-3 rounded border border-zinc-200 overflow-x-auto leading-relaxed [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-zinc-200 [&_th]:bg-zinc-100 [&_th]:px-2.5 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-mono [&_td]:border [&_td]:border-zinc-200 [&_td]:px-2.5 [&_td]:py-1.5 [&_td]:font-mono">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>
@@ -1598,7 +1663,7 @@ export const PlotlyDeck: React.FC<PlotlyDeckProps> = ({
 
                     <div>
                       <h4 className="text-[11px] font-semibold text-zinc-700 uppercase tracking-wider font-mono mb-1.5">
-                        Mudlog Hydrocarbon Notes:
+                        Report text: petrophysical &amp; mudlog notes
                       </h4>
                       <div className="text-xs text-zinc-800 bg-zinc-50 p-3 rounded border border-zinc-200 leading-relaxed [&_table]:w-full [&_table]:border-collapse [&_th]:border [&_th]:border-zinc-200 [&_th]:bg-zinc-100 [&_th]:px-2.5 [&_th]:py-1.5 [&_th]:text-left [&_td]:border [&_td]:border-zinc-200 [&_td]:px-2.5 [&_td]:py-1.5">
                         <ReactMarkdown remarkPlugins={[remarkGfm]}>

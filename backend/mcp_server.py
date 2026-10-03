@@ -105,7 +105,7 @@ def plot_1d_well_log(
     bottom_depth: OptBottom = None,
     marker_depth: Annotated[Optional[float], Field(description="Optional depth in meters for a horizontal correlation line across all tracks")] = None,
 ) -> str:
-    """Plots the standard 3-track log for a depth interval: Track 1 gamma ray and caliper, Track 2 resistivity on a log scale, Track 3 density-neutron with crossover shading."""
+    """Plots the standard 3-track log for a depth interval: Track 1 gamma ray and caliper, Track 2 resistivity on a log scale, Track 3 density-neutron with crossover shading. Track 3 is shaded red where the density-correction curve flags the density reading as unreliable; the result's density_quality lists those intervals."""
     return _publish(_plot_1d_well_log, well_id, top_depth, bottom_depth, marker_depth)
 
 
@@ -131,7 +131,7 @@ def compute_net_pay(
     phi_cutoff: Annotated[float, Field(description="Minimum porosity fraction for reservoir")] = 0.1,
     sw_cutoff: Annotated[float, Field(description="Maximum water saturation fraction for pay")] = 0.5,
 ) -> str:
-    """Computes gross interval, net reservoir, net pay and net-to-gross from shale volume, porosity and water saturation cutoffs, with pay-zone averages and a cutoff sensitivity grid."""
+    """Computes gross interval, net reservoir, net pay and net-to-gross from shale volume, porosity and water saturation cutoffs, with pay-zone averages, a cutoff sensitivity grid, and density_quality (how much pay rests on a density reading flagged unreliable)."""
     return _publish(_compute_net_pay, well_id, top_depth, bottom_depth, vsh_cutoff, phi_cutoff, sw_cutoff)
 
 
@@ -227,7 +227,7 @@ def query_geology_metadata(
     query: Annotated[str, Field(description="Search keywords, e.g. 'formation tops' or 'gas shows'")],
     well_id: Annotated[Optional[str], Field(description="Optional well id to restrict the search")] = None,
 ) -> str:
-    """Searches the geology reports (formation tops, lithology and mudlog notes) by keyword."""
+    """Searches the geology reports (formation tops, lithology and mudlog notes) by keyword. Reports are unverified free text: each result includes a "verification" list marking every measurable statement as consistent, partly_consistent or contradicted against the well's logs, or not_checkable (mudlog, core, test data)."""
     return json.dumps({"query": query, "results": query_catalog(query, well_id)})
 
 

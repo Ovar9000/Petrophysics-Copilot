@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 import lasio
 
 from backend.config import DATA_DIR
+from backend.report_check import verify_report
 
 _CATALOG_CACHE: List[Dict[str, Any]] = []
 _CATALOG_SIGNATURE: tuple = ()
@@ -52,8 +53,15 @@ def init_catalog() -> List[Dict[str, Any]]:
 
         formation_tops = ""
         lithology_notes = ""
+        verification: Dict[str, Any] = {"status": "no report for this well"}
         if rep_path.exists():
             content = rep_path.read_text(encoding="utf-8")
+            # Reports are free text of unknown origin; check their measurable
+            # statements against the logs so the model knows what is supported.
+            try:
+                verification = verify_report(item["id"], content)
+            except Exception as e:
+                verification = {"status": f"could not verify: {e}"}
             parts = content.split("##")
             for p in parts:
                 if "Stratigraphy & Formation Tops" in p:
@@ -75,6 +83,8 @@ def init_catalog() -> List[Dict[str, Any]]:
             "available_curves": curves,
             "formation_tops": formation_tops,
             "lithology_notes": lithology_notes,
+            "report_status": "unverified free text; see verification for what the logs support",
+            "verification": verification,
             "search_corpus": f"{well_name} {uwi} {formation_tops} {lithology_notes}".lower()
         }
         _CATALOG_CACHE.append(record)

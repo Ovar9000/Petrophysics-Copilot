@@ -28,6 +28,26 @@ export interface WellData {
   default_window?: DepthWindow;
 }
 
+// A geology-report statement checked against the well's logs (backend/report_check.py).
+export interface ReportCheck {
+  statement: string;
+  status: 'consistent' | 'partly_consistent' | 'contradicted' | 'not_checkable';
+  claimed?: string;
+  actual?: Record<string, any>;
+  rule?: string;
+  reason?: string;
+  note?: string;
+  interval_m?: [number, number];
+}
+
+export interface CatalogRecord {
+  well_id?: string;
+  well_name: string;
+  formation_tops: string;
+  lithology_notes: string;
+  verification?: { summary?: Record<string, number>; checks?: ReportCheck[]; status?: string };
+}
+
 // "What to look at / what to ask next", built by the backend from tool results.
 export interface Guide {
   observe: string[];

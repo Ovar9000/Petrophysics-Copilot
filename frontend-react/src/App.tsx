@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { ChatStream } from './components/ChatStream';
 import { PlotlyDeck } from './components/PlotlyDeck';
-import { WellData, MessageItem, NetPayKPIs, SweetspotScanResult, Guide } from './types';
+import { WellData, MessageItem, NetPayKPIs, SweetspotScanResult, Guide, CatalogRecord } from './types';
 
 const API_BASE = typeof window !== 'undefined' ? `http://${window.location.hostname}:8000` : 'http://127.0.0.1:8000';
 
@@ -34,7 +34,7 @@ export const App: React.FC = () => {
   const [activeFigureJson, setActiveFigureJson] = useState<string | null>(null);
   const [netPayData, setNetPayData] = useState<NetPayKPIs | null>(null);
   const [sweetspotsData, setSweetspotsData] = useState<SweetspotScanResult | null>(null);
-  const [citations, setCitations] = useState<Array<{ well_name: string; formation_tops: string; lithology_notes: string }>>([]);
+  const [citations, setCitations] = useState<CatalogRecord[]>([]);
 
   const [messages, setMessages] = useState<MessageItem[]>([
     {
